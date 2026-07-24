@@ -1077,6 +1077,7 @@ def cli_estimate(
     afd_phase: str = "decode",
     afd_combined_with_pd: bool = True,
     afd_boundary_on_attn: bool = True,
+    afd_moe_time_ms: float | None = None,
 ) -> EstimateResult:
     """
     Estimate TTFT, TPOT, and power for a single model/system/config combination.
@@ -1205,6 +1206,10 @@ def cli_estimate(
             ``logits_gemm``) to the A-Worker when True (default); set False to
             place them on the F-Worker. Inverse of the CLI ``--boundary-on-ffn``
             flag.
+        afd_moe_time_ms: (afd decode-only) Measured MoE-stage wall time for
+            the full resident batch across all layers and microbatches.
+            Replaces all F-side compute and stage communication; excludes
+            router.
 
     Returns:
         EstimateResult with ttft, tpot, power_w, mode, and the full raw result dict.
@@ -1291,6 +1296,9 @@ def cli_estimate(
                 f"backend={backend_name}, version={resolved_version}."
             )
         return db
+
+    if afd_moe_time_ms is not None and mode != "afd":
+        raise ValueError("afd_moe_time_ms is valid only for AFD mode.")
 
     if mode in ("static", "static_ctx", "static_gen"):
         resolved_version = _resolve_version_for(system_name)
@@ -1453,6 +1461,8 @@ def cli_estimate(
                 raise ValueError(f"{name} is required for afd mode.")
         if afd_phase not in ("prefill", "decode", "both"):
             raise ValueError(f"afd_phase must be 'prefill', 'decode', or 'both'; got {afd_phase!r}.")
+        if afd_moe_time_ms is not None and afd_phase != "decode":
+            raise ValueError("afd_moe_time_ms is supported only for AFD decode.")
         # ``combined_with_pd`` only makes sense for single-phase AFD: when
         # AFD covers prefill+decode internally there is no separate static
         # pool to combine with. ``AFDConfig.__post_init__`` enforces the
@@ -1486,6 +1496,7 @@ def cli_estimate(
             afd_phase=afd_phase,
             afd_combined_with_pd=afd_combined_with_pd,
             afd_boundary_on_attn=afd_boundary_on_attn,
+            afd_moe_time_ms=afd_moe_time_ms,
             gemm_quant_mode=gemm_quant_mode,
             kvcache_quant_mode=kvcache_quant_mode,
             fmha_quant_mode=fmha_quant_mode,
@@ -2231,6 +2242,7 @@ def _run_afd_estimate(
     afd_phase,
     afd_combined_with_pd,
     afd_boundary_on_attn,
+    afd_moe_time_ms=None,
     gemm_quant_mode,
     kvcache_quant_mode,
     fmha_quant_mode,
@@ -2358,6 +2370,7 @@ def _run_afd_estimate(
         database=database,
         backend=backend,
         afd_config=afd_config,
+        afd_moe_time_ms=afd_moe_time_ms,
     )
     summary = session.run_afd(
         runtime_config,

@@ -4,6 +4,7 @@
 import copy
 import functools
 import logging
+import math
 import warnings
 from collections import defaultdict, namedtuple
 
@@ -997,6 +998,7 @@ class AFDInferenceSession:
         database: perf_database.PerfDatabase,
         backend: BaseBackend,
         afd_config: config.AFDConfig,
+        afd_moe_time_ms: float | None = None,
     ) -> None:
         self._model_path = model_path
         self._a_model_config = a_model_config
@@ -1009,6 +1011,9 @@ class AFDInferenceSession:
         self._database = database
         self._backend = backend
         self._afd_config = afd_config
+        if afd_moe_time_ms is not None and (not math.isfinite(afd_moe_time_ms) or afd_moe_time_ms <= 0):
+            raise ValueError("afd_moe_time_ms must be finite and > 0.")
+        self._afd_moe_time_ms = afd_moe_time_ms
 
     # ------------------------------------------------------------------ #
     # Private helpers
@@ -1474,6 +1479,8 @@ class AFDInferenceSession:
         brk_t_f_per_layer: float,
         t_a2f_layer: float,
         t_f2a_layer: float,
+        afd_moe_time_ms: float | None = None,
+        num_microbatches: int = 1,
     ) -> tuple[float, float, float, float, dict, dict, bool]:
         """Integrate compute latency along the decode KV-cache length.
 
@@ -1527,14 +1534,18 @@ class AFDInferenceSession:
                 runtime_config=runtime_config,
                 is_context=False,
             )
-            t_f_step_i, f_per_op_i = self._sum_latency(
-                f_partition.ffn_ops,
-                batch_size=b_batch_size * verify_width,
-                seq_len=s_i,
-                model=f_model,
-                runtime_config=runtime_config,
-                is_context=False,
-            )
+            if afd_moe_time_ms is None:
+                t_f_step_i, f_per_op_i = self._sum_latency(
+                    f_partition.ffn_ops,
+                    batch_size=b_batch_size * verify_width,
+                    seq_len=s_i,
+                    model=f_model,
+                    runtime_config=runtime_config,
+                    is_context=False,
+                )
+            else:
+                t_f_step_i = afd_moe_time_ms / num_microbatches
+                f_per_op_i = {"afd_moe_stage": t_f_step_i}
 
             t_a_layer_i = t_a_step_i / num_layers + brk_t_a_per_layer
             t_f_layer_i = t_f_step_i / num_layers + brk_t_f_per_layer
@@ -1627,6 +1638,14 @@ class AFDInferenceSession:
         # them to the F-Worker for sensitivity studies.
         a_partition = build_afd_ops_partition(a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         f_partition = build_afd_ops_partition(f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
+        afd_moe_time_ms = self._afd_moe_time_ms if phase == "decode" else None
+        if afd_moe_time_ms is not None:
+            # A measured MoE stage replaces the whole F side (dispatch, expert
+            # compute, combine); the router stays on the attention pool.
+            router_ops = [op for op in a_partition.ffn_ops if "router" in op._name.lower()]
+            a_partition.attn_ops.extend(router_ops)
+            a_partition.ffn_ops = [op for op in a_partition.ffn_ops if op not in router_ops]
+            f_partition.ffn_ops = [op for op in f_partition.ffn_ops if "router" not in op._name.lower()]
 
         isl = runtime_config.isl
         osl = runtime_config.osl or 1
@@ -1663,25 +1682,32 @@ class AFDInferenceSession:
         # Each op's name flows into ``a_per_op`` / ``f_per_op`` as a
         # distinct label so the --detail report can attribute comm cost
         # back to the specific collective rather than a single bucket.
-        comm_ops = self._build_afd_comm_ops(a_model, f_model)
-        r_a2f = comm_ops.a2f.query(self._database, x=afd_a_batch_tokens)
-        r_f2a = comm_ops.f2a.query(self._database, x=afd_a_batch_tokens)
-        r_ag = comm_ops.f_ag.query(self._database, x=afd_a_batch_tokens)
-        r_rs = comm_ops.f_rs.query(self._database, x=afd_a_batch_tokens)
-        r_cmb = comm_ops.a_combine.query(self._database, x=afd_a_batch_tokens)
+        if afd_moe_time_ms is None:
+            comm_ops = self._build_afd_comm_ops(a_model, f_model)
+            r_a2f = comm_ops.a2f.query(self._database, x=afd_a_batch_tokens)
+            r_f2a = comm_ops.f2a.query(self._database, x=afd_a_batch_tokens)
+            r_ag = comm_ops.f_ag.query(self._database, x=afd_a_batch_tokens)
+            r_rs = comm_ops.f_rs.query(self._database, x=afd_a_batch_tokens)
+            r_cmb = comm_ops.a_combine.query(self._database, x=afd_a_batch_tokens)
+        else:
+            r_a2f = r_f2a = r_ag = r_rs = r_cmb = 0.0
 
         # Re-pack into the legacy per-bucket breakdown so the downstream
         # per-op fold-in and per-step pipeline stay unchanged. Keys are
         # the op ``_name`` values from ``_build_afd_comm_ops``.
-        brk = {
-            "t_a2f": {comm_ops.a2f._name: float(r_a2f)},
-            "t_f2a": {comm_ops.f2a._name: float(r_f2a)},
-            "t_f": {
-                comm_ops.f_ag._name: float(r_ag),
-                comm_ops.f_rs._name: float(r_rs),
-            },
-            "t_a": {comm_ops.a_combine._name: float(r_cmb)},
-        }
+        brk = (
+            {
+                "t_a2f": {comm_ops.a2f._name: float(r_a2f)},
+                "t_f2a": {comm_ops.f2a._name: float(r_f2a)},
+                "t_f": {
+                    comm_ops.f_ag._name: float(r_ag),
+                    comm_ops.f_rs._name: float(r_rs),
+                },
+                "t_a": {comm_ops.a_combine._name: float(r_cmb)},
+            }
+            if afd_moe_time_ms is None
+            else {"t_a2f": {}, "t_f2a": {}, "t_f": {}, "t_a": {}}
+        )
         t_a2f_layer = float(r_a2f)
         t_f2a_layer = float(r_f2a)
         t_c_layer = t_a2f_layer + t_f2a_layer
@@ -1723,6 +1749,8 @@ class AFDInferenceSession:
                 brk_t_f_per_layer=brk_t_f_per_layer,
                 t_a2f_layer=t_a2f_layer,
                 t_f2a_layer=t_f2a_layer,
+                afd_moe_time_ms=afd_moe_time_ms,
+                num_microbatches=max(int(cfg.num_microbatches or 1), 1),
             )
             # ``comm_hidden`` was captured during the decode integration
             # loop above — reuse it instead of re-evaluating
@@ -2017,9 +2045,18 @@ class AFDInferenceSession:
             # tpot (= t_step) is the global decode-step latency after
             # pipeline overlap; the system produces b_total tokens per
             # global step, so throughput = b_total / tpot.
+            #
+            # NOTE (merge): upstream `afd-moe-timing` sets
+            # `decode_batch_service_time_ms = num_microbatches * tpot`. That is
+            # correct on `main`, where `t_step = num_layers * t_cycle` covers a
+            # single microbatch. On this branch `_pipeline_global_step_latency`
+            # already spans `num_microbatches * num_layers`, so multiplying
+            # again would double-count the microbatch dimension.
+            decode_batch_service_time_ms = tpot
             tokens_per_s = b_total / (tpot / 1000.0) if tpot > 0 else 0.0
         else:
             tpot = 0.0
+            decode_batch_service_time_ms = 0.0
             tokens_per_s = 0.0
 
         if prefill_metrics is not None:
@@ -2117,6 +2154,7 @@ class AFDInferenceSession:
             "decode_comm_hidden": decode_scalars["comm_hidden"],
             "ttft": round(ttft, 3),
             "tpot": round(tpot, 3),
+            "decode_batch_service_time_ms": decode_batch_service_time_ms,
             "request_latency": round(request_latency, 3),
             "b_total": b_total,
             "b_micro_total": b_micro_total,
@@ -2135,6 +2173,7 @@ class AFDInferenceSession:
             "nextn": self._nextn,
             "combined_with_pd": bool(cfg.combined_with_pd),
             "boundary_on_attn": bool(cfg.boundary_on_attn),
+            "afd_moe_time_ms": self._afd_moe_time_ms,
             "num_total_gpus": total_gpus,
             "memory": round(max(a_memory_gb, f_memory_gb), 2),
             "backend": self._backend.name.value,
