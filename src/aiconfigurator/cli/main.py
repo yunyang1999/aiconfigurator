@@ -853,6 +853,15 @@ def _add_estimate_mode_arguments(parser):
         default=False,
         help="Assign boundary ops (add_norm_2, logits_gemm) to F-Worker. Default is A-Worker; pass this flag to flip.",
     )
+    parser.add_argument(
+        "--afd-moe-time-ms",
+        type=float,
+        default=None,
+        help=(
+            "Measured decode MoE-stage wall time for the full resident batch across all layers and microbatches. "
+            "Replaces all F-side compute and stage communication; excludes router."
+        ),
+    )
 
     # Quantization
     parser.add_argument(
@@ -2254,6 +2263,7 @@ def _run_estimate_mode(args):
             afd_phase=args.afd_phase,
             afd_combined_with_pd=getattr(args, "afd_combined_with_pd", True),
             afd_boundary_on_attn=not getattr(args, "boundary_on_ffn", False),
+            afd_moe_time_ms=args.afd_moe_time_ms,
         )
 
     result = cli_estimate(**estimate_kwargs)
@@ -2378,6 +2388,8 @@ def _run_estimate_mode(args):
             print(f"  Composition:      (p)={p_impl or 'unmodeled'}  (d)={d_impl or 'unmodeled'}")
         print(f"  TTFT:             {result.ttft:.3f} ms")
         print(f"  TPOT:             {result.tpot:.3f} ms")
+        if raw.get("decode_batch_service_time_ms"):
+            print(f"  Decode service:   {raw['decode_batch_service_time_ms']:.3f} ms")
         print(f"  Request Latency:  {result.request_latency:.3f} ms")
     else:
         print(f"  TTFT:             {result.ttft:.3f} ms")
