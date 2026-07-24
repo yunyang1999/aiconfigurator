@@ -236,6 +236,7 @@ def test_run_afd_estimate_passes_prefix_and_nextn(monkeypatch):
         def __init__(self, **kwargs):
             captured["a_model_config"] = kwargs["a_model_config"]
             captured["f_model_config"] = kwargs["f_model_config"]
+            captured["afd_moe_time_ms"] = kwargs["afd_moe_time_ms"]
 
         def run_afd(self, runtime_config, **kwargs):
             captured["runtime_config"] = runtime_config
@@ -281,6 +282,7 @@ def test_run_afd_estimate_passes_prefix_and_nextn(monkeypatch):
         afd_phase="decode",
         afd_combined_with_pd=False,
         afd_boundary_on_attn=True,
+        afd_moe_time_ms=12.5,
         gemm_quant_mode=None,
         kvcache_quant_mode=None,
         fmha_quant_mode=None,
@@ -302,6 +304,95 @@ def test_run_afd_estimate_passes_prefix_and_nextn(monkeypatch):
     assert not hasattr(captured["a_model_config"], "nextn_accepted")
     assert not hasattr(captured["f_model_config"], "nextn_accepted")
     assert captured["speculative_profile"].expected_accepted_tokens == 0.85
+    assert captured["afd_moe_time_ms"] == 12.5
+
+
+def test_afd_moe_time_replaces_generic_f_and_comm(monkeypatch):
+    router = SimpleNamespace(_name="generation_router_gemm")
+    a_op = SimpleNamespace(_name="generation_attention")
+    f_op = SimpleNamespace(_name="generation_moe")
+    partitions = [
+        SimpleNamespace(attn_ops=[a_op], ffn_ops=[router, f_op]),
+        SimpleNamespace(attn_ops=[a_op], ffn_ops=[router, f_op]),
+    ]
+    captured = {"sum_ops": []}
+
+    monkeypatch.setattr(
+        "aiconfigurator.sdk.afd_partition.build_afd_ops_partition",
+        lambda *_args, **_kwargs: partitions.pop(0),
+    )
+
+    def fake_sum(self, ops, **_kwargs):
+        captured["sum_ops"].append([op._name for op in ops])
+        if f_op in ops:
+            raise AssertionError("generic F ops must not be queried")
+        return 10.0, {op._name: 10.0 / len(ops) for op in ops}
+
+    def fake_memory_summary(self, _memory, runtime_config, _free_gpu_memory_fraction):
+        summary = InferenceSummary(runtime_config)
+        summary.set_oom(False)
+        summary.set_kv_cache_oom(False)
+        return summary
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", fake_sum)
+    monkeypatch.setattr(
+        AFDInferenceSession,
+        "_build_afd_comm_ops",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("generic AFD comm must not be queried")),
+    )
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_a_memory_dict", lambda *_args, **_kwargs: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_f_memory_dict", lambda *_args, **_kwargs: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_check_memory_dict", fake_memory_summary)
+
+    cfg = AFDConfig(
+        n_a_nodes=1,
+        n_f_nodes=1,
+        gpus_per_node=4,
+        tp_a=1,
+        a_batch_size=8,
+        num_microbatches=2,
+        f_moe_ep_size=4,
+        pipeline_model="conservative",
+        combined_with_pd=False,
+    )
+    session = AFDInferenceSession(
+        model_path="test-model",
+        a_model_config=SimpleNamespace(),
+        f_model_config=SimpleNamespace(),
+        database=object(),
+        backend=object(),
+        afd_config=cfg,
+        afd_moe_time_ms=12.0,
+    )
+
+    metrics = session._simulate_phase(
+        phase="decode",
+        runtime_config=RuntimeConfig(isl=99, osl=2),
+        a_model=SimpleNamespace(_num_layers=2),
+        f_model=SimpleNamespace(_num_layers=2),
+        free_gpu_memory_fraction=None,
+        max_seq_len=None,
+    )
+
+    assert captured["sum_ops"] == [["generation_attention", "generation_router_gemm"]]
+    assert metrics["f_per_op"] == {"afd_moe_stage": pytest.approx(6.0)}
+    assert metrics["t_f_layer"] == pytest.approx(3.0)
+    assert metrics["t_a2f_layer"] == metrics["t_f2a_layer"] == 0.0
+    assert metrics["t_step"] == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.inf, math.nan])
+def test_afd_moe_time_must_be_positive_and_finite(value):
+    with pytest.raises(ValueError, match="finite and > 0"):
+        AFDInferenceSession(
+            model_path="test-model",
+            a_model_config=SimpleNamespace(),
+            f_model_config=SimpleNamespace(),
+            database=object(),
+            backend=object(),
+            afd_config=AFDConfig(n_a_nodes=1, n_f_nodes=1, gpus_per_node=4, tp_a=1),
+            afd_moe_time_ms=value,
+        )
 
 
 def test_afd_prefill_uses_uncached_prefix_suffix_for_token_math(monkeypatch):
@@ -493,6 +584,7 @@ def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):
     assert result["b_total"] == expected_b_total
     assert result["concurrency"] == expected_b_total
     assert result["b_micro_total"] == session._afd_config.n_a_workers * 2
+    assert result["decode_batch_service_time_ms"] == pytest.approx(150.0)
 
 
 def test_afd_summary_uses_global_batch_tpot_for_pipeline(monkeypatch):

@@ -81,6 +81,22 @@ class TestCLIArgumentParsing:
         )
         assert args.model_path == "Qwen/Qwen3-8B"
 
+    def test_estimate_mode_accepts_afd_moe_time(self, cli_parser):
+        args = cli_parser.parse_args(
+            [
+                "estimate",
+                "--model-path",
+                "Qwen/Qwen3-32B",
+                "--system",
+                "gb200",
+                "--estimate-mode",
+                "afd",
+                "--afd-moe-time-ms",
+                "24.5",
+            ]
+        )
+        assert args.afd_moe_time_ms == pytest.approx(24.5)
+
     def test_backend_choices_validation(self, cli_parser):
         """Test that backend argument validates against supported choices."""
         subparser_action = next(action for action in cli_parser._actions if action.dest == "mode")
