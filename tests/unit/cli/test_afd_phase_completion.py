@@ -381,6 +381,100 @@ def test_afd_moe_time_replaces_generic_f_and_comm(monkeypatch):
     assert metrics["t_step"] == pytest.approx(10.0)
 
 
+def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
+    a_op = SimpleNamespace(_name="generation_attention")
+    f_op = SimpleNamespace(_name="generation_moe")
+    partitions = [
+        SimpleNamespace(attn_ops=[a_op], ffn_ops=[]),
+        SimpleNamespace(attn_ops=[], ffn_ops=[f_op]),
+    ]
+    queried_batches = []
+    queried_transfers = []
+
+    monkeypatch.setattr(
+        "aiconfigurator.sdk.afd_partition.build_afd_ops_partition",
+        lambda *_args, **_kwargs: partitions.pop(0),
+    )
+
+    def fake_sum(self, ops, **kwargs):
+        queried_batches.append((ops[0]._name, kwargs["batch_size"]))
+        return 1.0, {ops[0]._name: 1.0}
+
+    class FakeComm:
+        def __init__(self, name):
+            self._name = name
+
+        def query(self, _database, *, x):
+            queried_transfers.append((self._name, x))
+            return 0.0
+
+    def fake_memory_summary(self, _memory, runtime_config, _free_gpu_memory_fraction):
+        summary = InferenceSummary(runtime_config)
+        summary.set_oom(False)
+        summary.set_kv_cache_oom(False)
+        return summary
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", fake_sum)
+    monkeypatch.setattr(
+        AFDInferenceSession,
+        "_build_afd_comm_ops",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            a2f=FakeComm("a2f"),
+            f2a=FakeComm("f2a"),
+            f_ag=FakeComm("f_ag"),
+            f_rs=FakeComm("f_rs"),
+            a_combine=FakeComm("a_combine"),
+        ),
+    )
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_a_memory_dict", lambda *_args, **_kwargs: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_f_memory_dict", lambda *_args, **_kwargs: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_check_memory_dict", fake_memory_summary)
+
+    cfg = AFDConfig(
+        n_a_nodes=1,
+        n_f_nodes=1,
+        gpus_per_node=4,
+        tp_a=1,
+        a_batch_size=8,
+        num_microbatches=2,
+        f_moe_ep_size=4,
+        pipeline_model="conservative",
+        combined_with_pd=False,
+    )
+    session = AFDInferenceSession(
+        model_path="test-model",
+        a_model_config=SimpleNamespace(),
+        f_model_config=SimpleNamespace(),
+        database=object(),
+        backend=object(),
+        afd_config=cfg,
+    )
+
+    session._simulate_phase(
+        phase="decode",
+        runtime_config=RuntimeConfig(isl=99, osl=2),
+        a_model=SimpleNamespace(_num_layers=2, _nextn=2),
+        f_model=SimpleNamespace(_num_layers=2, _nextn=2),
+        free_gpu_memory_fraction=None,
+        max_seq_len=None,
+    )
+
+    # A microbatch is 8 / 2 = 4 requests. The F pool receives all four
+    # A-worker microbatches, so its baseline is 16 requests. nextn=2 verifies
+    # three target tokens per request on both pools.
+    assert queried_batches == [
+        ("generation_attention", 12),
+        ("generation_moe", 48),
+    ]
+    assert queried_transfers == [
+        ("a2f", 12),
+        ("f2a", 12),
+        ("f_ag", 12),
+        ("f_rs", 12),
+        ("a_combine", 12),
+    ]
+
+
 @pytest.mark.parametrize("value", [0.0, -1.0, math.inf, math.nan])
 def test_afd_moe_time_must_be_positive_and_finite(value):
     with pytest.raises(ValueError, match="finite and > 0"):

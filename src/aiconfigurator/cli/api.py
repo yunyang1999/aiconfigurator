@@ -1790,9 +1790,9 @@ def _run_afd_estimate(
         moe_quant_mode,
         comm_quant_mode,
     )
-    # Pass speculative decode knobs through to A/F model configs. TODO:
-    # AFDTransfer still models committed decode-token volume only; recalibrate
-    # MTP transfer amplification once the serving semantics are finalized.
+    # Pass speculative decode knobs through to A/F model configs. The AFD
+    # session expands decode compute and transfer volume to nextn + 1 target
+    # verification tokens, matching the regular backend path.
     _apply_nextn(a_model_config, nextn)
     _apply_nextn(f_model_config, nextn)
     # The A-worker runs context attention whenever the phase covers prefill

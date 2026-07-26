@@ -1572,11 +1572,14 @@ class AFDInferenceSession:
         # ReduceScatter, A-side combine) bills by *token* volume per
         # step, not request count.  In prefill each request contributes
         # the uncached suffix
-        # (``isl - prefix``) per layer; in decode it contributes 1 token per
-        # step.  Each comm op's ``query(x=...)`` takes the number of tokens
-        # held by a single A-rank; the op internally fans this out to the
-        # global token count via ``n_a_workers``.
-        tokens_per_req = effective_prefill_len if phase == "prefill" else self._nextn + 1
+        # (``isl - prefix``) per layer; in decode it contributes the complete
+        # speculative verification width (``nextn + 1``).  This mirrors the
+        # regular backend's decode-batch expansion.  Each comm op's
+        # ``query(x=...)`` takes the number of tokens held by a single A-rank;
+        # the op internally fans this out to the global token count via
+        # ``n_a_workers``.
+        verification_width = max(int(getattr(a_model, "_nextn", 0)), 0) + 1
+        tokens_per_req = effective_prefill_len if phase == "prefill" else verification_width
         afd_a_batch_tokens = a_micro_batch_size * tokens_per_req
 
         # Five comm-side ops model the per-layer AFD traffic:
@@ -1650,8 +1653,11 @@ class AFDInferenceSession:
                 runtime_config=runtime_config,
                 isl=isl,
                 osl=osl,
-                a_batch_size=a_micro_batch_size,
-                b_batch_size=b_micro_total,
+                # Speculative verification evaluates nextn+1 target tokens per
+                # active request.  The model op scales separately account for
+                # the draft-layer work.
+                a_batch_size=a_micro_batch_size * verification_width,
+                b_batch_size=b_micro_total * verification_width,
                 num_layers=num_layers,
                 brk_t_a_per_layer=brk_t_a_per_layer,
                 brk_t_f_per_layer=brk_t_f_per_layer,
