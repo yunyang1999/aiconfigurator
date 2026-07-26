@@ -23,7 +23,7 @@ git -C FastAFD checkout 3c7161949310b6d59d6b4cf9bf997a4935c8113b
 
 Feature baseline commits:
 
-- AIC: `6e7442b2bb86d7553fbaf27c843da5713d2a69a7`
+- AIC: `d862321fb56cb0d15b8ec775eca9da751e54d06c`
 - Dynamo: `818501a6d21bc2669ae8ef275e606db82a918441`
 - FastAFD: `3c7161949310b6d59d6b4cf9bf997a4935c8113b`
 
