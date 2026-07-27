@@ -209,6 +209,31 @@ class TestContextAttention:
 class TestGenerationAttention:
     """Test cases for query_generation_attention method."""
 
+    def test_fused_verification_reuses_the_shared_kv_prefix(self, mutable_comprehensive_perf_db):
+        from aiconfigurator.sdk.operations import GenerationAttention
+
+        mutable_comprehensive_perf_db.system_spec["gpu"].update(
+            {
+                "bfloat16_tc_flops": 2_500_000_000_000_000.0,
+                "mem_bw": 8_000_000_000_000.0,
+            }
+        )
+        op = GenerationAttention(
+            "generation_attention",
+            scale_factor=1.0,
+            n=32,
+            n_kv=8,
+            kv_cache_dtype=common.KVCacheQuantMode.bfloat16,
+        )
+        kwargs = {"batch_size": 4, "beam_width": 1, "s": 8192}
+
+        single = op.query(mutable_comprehensive_perf_db, **kwargs)
+        fused = op.query(mutable_comprehensive_perf_db, query_len=4, **kwargs)
+
+        # Four causal queries remain memory-bound when the prefix is read once.
+        assert float(fused) < float(single) * 1.1
+        assert fused.source == "estimated"
+
     def test_query_generation_attention_database_mode(self, comprehensive_perf_db):
         """Test SOL mode calculation for generation attention."""
         b, s, n, n_kv = 4, 128, 32, 8

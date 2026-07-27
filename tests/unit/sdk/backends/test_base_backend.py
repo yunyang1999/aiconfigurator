@@ -9,6 +9,7 @@ import pytest
 from aiconfigurator.sdk import common
 from aiconfigurator.sdk.backends.base_backend import BaseBackend
 from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
+from aiconfigurator.sdk.operations import GenerationAttention
 
 pytestmark = pytest.mark.unit
 
@@ -30,6 +31,32 @@ class _StaticOp:
 
     def query(self, *args, **kwargs) -> _LatencyResult:
         return _LatencyResult(self._latency_ms, self._energy_wms)
+
+
+class _CaptureGenerationAttention(GenerationAttention):
+    def __init__(self) -> None:
+        super().__init__(
+            "generation_attention",
+            scale_factor=1.0,
+            n=8,
+            n_kv=2,
+            kv_cache_dtype=common.KVCacheQuantMode.bfloat16,
+        )
+        self.calls = []
+
+    def query(self, *args, **kwargs) -> _LatencyResult:
+        self.calls.append(kwargs)
+        return _LatencyResult(2.0, 20.0)
+
+
+class _CaptureOp(_StaticOp):
+    def __init__(self, name: str) -> None:
+        super().__init__(name, latency_ms=1.0, energy_wms=10.0)
+        self.calls = []
+
+    def query(self, *args, **kwargs) -> _LatencyResult:
+        self.calls.append(kwargs)
+        return super().query(*args, **kwargs)
 
 
 class _TestBackend(BaseBackend):
@@ -179,6 +206,30 @@ def test_run_static_can_route_to_rust_engine_step_backend(
     assert summary.get_generation_energy_wms_dict() == {"rust_engine_step_generation": 0.0}
     assert summary.get_context_source_dict() == {"rust_engine_step_context": "rust"}
     assert summary.get_generation_source_dict() == {"rust_engine_step_generation": "rust"}
+
+
+def test_generation_mtp_keeps_sequence_batch_for_attention(backend: BaseBackend, model, database) -> None:
+    attention = _CaptureGenerationAttention()
+    dense = _CaptureOp("generation_mlp")
+    model._nextn = 3
+    model.generation_ops = [attention, dense]
+
+    backend._run_generation_phase(
+        model,
+        database,
+        RuntimeConfig(batch_size=5, beam_width=1, isl=8192, osl=2),
+        batch_size=5,
+        beam_width=1,
+        isl=8192,
+        osl=2,
+        stride=1,
+    )
+
+    assert attention.calls[0]["batch_size"] == 5
+    assert attention.calls[0]["query_len"] == 4
+    assert attention.calls[0]["x"] == 20
+    assert dense.calls[0]["batch_size"] == 20
+    assert "query_len" not in dense.calls[0]
 
 
 def test_run_agg_with_osl_one_does_not_divide_by_zero(

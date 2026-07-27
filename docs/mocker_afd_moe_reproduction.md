@@ -1,44 +1,38 @@
-# Reproducing the FastAFD Workload with AIC AFD and Dynamo Mocker
+# Reproducing AFD With and Without MTP
 
-This guide covers one path only:
+This guide runs the same fixed-resident decode case in four modes:
 
-`FastAFD workload and measured F-stage time → AIC AFD domain decode service → Dynamo Mocker`
+| Mode | A/F split | MTP |
+|---|---:|---:|
+| `agg` | no | off |
+| `afd` | yes | off |
+| `agg_mtp` | no | on |
+| `afd_mtp` | yes | on |
 
-The example uses Qwen3-235B-A22B-FP8 on GB200 NVL72 with a `17A:1F`
-split. AIC and Mocker do not require GPUs. GPUs are required only when
-remeasuring the FastAFD F-stage time.
+Two execution paths are supported:
 
-## 1. Pin the Code Versions
+1. **AIC direct** compares the compute service time of one resident decode
+   round.
+2. **Dynamo Mocker** consumes the same AIC service time and adds request
+   arrivals, scheduling, batching, KV-cache pressure, queueing, and output-token
+   completion.
+
+Both paths are CPU-only. A GPU is needed only to obtain measured operation
+times supplied through `afd_moe_time_ms`.
+
+## 1. Code
 
 ```bash
-mkdir -p ~/afd-repro && cd ~/afd-repro
-
 git clone --branch afd-moe-timing \
   git@github.com:liz-badada/aiconfigurator.git
 git clone --branch afd-moe-timing \
   git@github.com:liz-badada/dynamo.git
-git clone https://github.com/hao-ai-lab/FastAFD.git
-git -C FastAFD checkout 3c7161949310b6d59d6b4cf9bf997a4935c8113b
-```
 
-Feature baseline commits:
-
-- AIC: `d862321fb56cb0d15b8ec775eca9da751e54d06c`
-- Dynamo: `818501a6d21bc2669ae8ef275e606db82a918441`
-- FastAFD: `3c7161949310b6d59d6b4cf9bf997a4935c8113b`
-
-The Dynamo branch has no AFD-specific patch. Mocker already provides the
-standard profile interface required by this workflow, so adding a second
-AFD/MoE-specific timing interface would duplicate functionality.
-
-## 2. Install AIC and Dynamo
-
-```bash
-cd ~/afd-repro/aiconfigurator
+cd aiconfigurator
 python3 -m uv sync --extra dev
 git lfs pull
 
-cd ~/afd-repro/dynamo
+cd ../dynamo
 uv venv .venv
 source .venv/bin/activate
 uv pip install pip 'maturin[patchelf]'
@@ -47,201 +41,262 @@ uv pip install -e lib/gpu_memory_service
 uv pip install -e .
 ```
 
-The Dynamo Python source and Rust binding must come from the same checkout.
-Do not mount current Python source over an older Dynamo image or binding.
+## 2. MTP Contract
 
-## 3. Define the FastAFD Case and F-stage Input
+For draft depth `nextn=N`, AIC models one target-verification round with
+`q=N+1` query tokens per active request.
 
-The FastAFD NVL72 8K case can be launched as follows. It requires an active
-18-node Ray cluster:
+If `r_i` is the conditional acceptance probability of draft position `i`,
 
-```bash
-cd ~/afd-repro/FastAFD
-
-MODEL_PATH=/path/to/Qwen3-235B-A22B-FP8 \
-AFD_TOTAL_NODES=18 \
-RUN_VLLM_ALIGNMENT=0 \
-NSYS=1 \
-bash scripts/experiments/afd/qwen3_235b/\
-run_afd_qwen3_235b_a22b_fp8_8k_b96_dynamicnode_mb2_nsys_alignment.sh
+```text
+E[accepted drafts] = r1 + r1*r2 + ... + r1*r2*...*rN
+E[output tokens per round] = 1 + E[accepted drafts]
+effective TPOT = raw verification-round period / E[output tokens per round]
 ```
 
-The workload contract is:
+AIC direct applies the last division. A Mocker profile must instead contain the
+**raw verification-round wall time**; Mocker samples the accepted output-token
+burst and therefore applies progress itself.
 
-| Parameter | 8K | 16K |
-|---|---:|---:|
-| Resident batch per A GPU | 96 | 48 |
-| Number of microbatches | 2 | 2 |
-| Batch per microbatch per A GPU | 48 | 24 |
-| A GPUs across 17 A nodes | 68 | 68 |
-| Domain-wide resident requests | 6528 | 3264 |
+The same conditional rates must be used to generate the AIC profile and to run
+Mocker. Do not combine MTP with `decode_speedup_ratio`.
 
-`F_STAGE_MS` must be measured for the same case. It is the F-stage wall time
-for the full resident batch across all 94 layers and both microbatches. It
-includes F-side MoE compute and A-to-F/F-to-A stage communication, but excludes
-the A-side router. Do not pass the complete FastAFD decode-step time as
-`F_STAGE_MS`.
+## 3. Generate Four AIC Results and Mocker Profiles
 
-The `42.9378303527832 ms` value below is an existing reduced-topology B200
-measurement used to validate the software path. It is not a topology-exact
-GB200 NVL72 measurement. Replace it with the matching NVL72 measurement when
-one is available.
+The example below is a 72-GPU GB200 domain with `17A:1F`, attention TP1, and a
+resident batch of 96 per A GPU. Adjust the aggregate topology to the deployment
+being compared.
 
-## 4. Run AIC and Generate the Mocker Profile
+`MTP_ACCEPT_RATES` must come from a serving trace when distribution-sensitive
+latency is required. The example value is an equal-conditional-rate surrogate
+whose mean progress is 2.28125 tokens per round; it is not a measured
+per-position distribution.
 
 ```bash
-export AIC=~/afd-repro/aiconfigurator
 export CONTEXT=8192
-export OUTPUT_TOKENS=16
-export A_NODES=17
-export F_NODES=1
-export A_TP=1
-export PER_A_GPU_BATCH=96
-export F_STAGE_MS=42.9378303527832
-export PROFILE=/tmp/afd_8k_17a1f.npz
+export OUTPUT_TOKENS=256
+export MTP_NEXTN=3
+export MTP_ACCEPT_RATES=0.631245693194,0.631245693194,0.631245693194
 
-cd "$AIC"
-"$AIC/.venv/bin/python" - <<'PY'
-import logging
+cd aiconfigurator
+.venv/bin/python - <<'PY'
+import json
+import math
 import os
+from pathlib import Path
 
 import numpy as np
 
 from aiconfigurator.cli.api import cli_estimate
 
-logging.disable(logging.CRITICAL)
+MODEL = "Qwen/Qwen3-235B-A22B-FP8"
+SYSTEM = "gb200"
+BACKEND = "sglang"
+BACKEND_VERSION = "0.5.10"
+DATABASE_MODE = "HYBRID"
 
-context = int(os.environ["CONTEXT"])
-output_tokens = int(os.environ["OUTPUT_TOKENS"])
-a_nodes = int(os.environ["A_NODES"])
-f_nodes = int(os.environ["F_NODES"])
-a_tp = int(os.environ["A_TP"])
-per_a_gpu_batch = int(os.environ["PER_A_GPU_BATCH"])
-f_stage_ms = float(os.environ["F_STAGE_MS"])
-profile = os.environ["PROFILE"]
+CONTEXT = int(os.environ["CONTEXT"])
+OUTPUT_TOKENS = int(os.environ["OUTPUT_TOKENS"])
+NEXTN = int(os.environ["MTP_NEXTN"])
+RATES = tuple(float(x) for x in os.environ["MTP_ACCEPT_RATES"].split(","))
 
-# --a-batch-size is per A worker, and one A worker spans a_tp GPUs.
-a_batch_size = per_a_gpu_batch * a_tp
-a_workers = a_nodes * 4 // a_tp
-resident = a_workers * a_batch_size
+A_NODES = 17
+F_NODES = 1
+GPUS_PER_NODE = 4
+A_TP = 1
+PER_A_GPU_BATCH = 96
+A_BATCH_SIZE = PER_A_GPU_BATCH * A_TP
+NUM_MICROBATCHES = 2
+GLOBAL_BATCH = A_NODES * GPUS_PER_NODE // A_TP * A_BATCH_SIZE
 
-result = cli_estimate(
-    model_path="Qwen/Qwen3-235B-A22B-FP8",
-    system_name="gb200",
-    mode="afd",
-    backend_name="sglang",
-    backend_version="0.5.10",
-    database_mode="HYBRID",
-    isl=context - 1,
-    osl=2,
-    tp_size=4,
-    n_a_nodes=a_nodes,
-    n_f_nodes=f_nodes,
-    a_tp_size=a_tp,
-    a_batch_size=a_batch_size,
-    f_moe_ep_size=4,
-    num_microbatches=2,
-    pipeline_model="conservative",
-    afd_phase="decode",
-    afd_combined_with_pd=False,
-    kvcache_quant_mode="bfloat16",
-    comm_quant_mode="half",
-    afd_moe_time_ms=f_stage_ms,
-)
+# Same 72-GPU aggregate baseline: 18 independent four-GPU replicas.
+STATIC_REPLICAS = 18
+STATIC_TP = 4
+STATIC_ATTN_DP = 1
+STATIC_MOE_TP = 1
+STATIC_MOE_EP = 4
+STATIC_BATCH_PER_REPLICA = math.ceil(GLOBAL_BATCH / STATIC_REPLICAS)
 
-service_ms = float(result.raw["decode_batch_service_time_ms"])
-np.savez(
-    profile,
-    prefill_isl=np.array([0.0, float(resident * context)]),
-    prefill_ttft_ms=np.array([0.0, 1.0]),
-    decode_active_kv_tokens=np.array(
-        [0.0, float(resident * (context + output_tokens))]
-    ),
-    decode_context_length=np.array(
-        [float(context), float(context + output_tokens)]
-    ),
-    decode_itl=np.full((2, 2), service_ms),
-)
 
-print(f"resident_requests={resident}")
-print(f"microbatch_period_ms={result.tpot:.9f}")
-print(f"decode_batch_service_time_ms={service_ms:.9f}")
-print(f"profile={profile}")
+def expected_accepted(rates):
+    survival = 1.0
+    total = 0.0
+    for rate in rates:
+        survival *= rate
+        total += survival
+    return total
+
+
+def mtp_kwargs(enabled):
+    if not enabled:
+        return {}
+    if len(RATES) != NEXTN:
+        raise ValueError("MTP_ACCEPT_RATES must contain exactly MTP_NEXTN values")
+    return {
+        "nextn": NEXTN,
+        "nextn_accepted": expected_accepted(RATES),
+    }
+
+
+def common():
+    return {
+        "model_path": MODEL,
+        "system_name": SYSTEM,
+        "backend_name": BACKEND,
+        "backend_version": BACKEND_VERSION,
+        "database_mode": DATABASE_MODE,
+        "isl": CONTEXT - 1,
+        "osl": 2,
+        "kvcache_quant_mode": "bfloat16",
+        "comm_quant_mode": "half",
+    }
+
+
+def run_agg(mtp):
+    kwargs = common() | mtp_kwargs(mtp)
+    kwargs.update(
+        mode="static_gen",
+        batch_size=STATIC_BATCH_PER_REPLICA,
+        tp_size=STATIC_TP,
+        attention_dp_size=STATIC_ATTN_DP,
+        moe_tp_size=STATIC_MOE_TP,
+        moe_ep_size=STATIC_MOE_EP,
+    )
+    return cli_estimate(**kwargs)
+
+
+def run_afd(mtp):
+    kwargs = common() | mtp_kwargs(mtp)
+    kwargs.update(
+        mode="afd",
+        tp_size=STATIC_TP,
+        n_a_nodes=A_NODES,
+        n_f_nodes=F_NODES,
+        a_tp_size=A_TP,
+        a_batch_size=A_BATCH_SIZE,
+        f_moe_ep_size=GPUS_PER_NODE,
+        num_microbatches=NUM_MICROBATCHES,
+        pipeline_model="conservative",
+        afd_phase="decode",
+        afd_combined_with_pd=False,
+    )
+
+    # A measured override must match the active verification width. A q=1
+    # measurement must not be reused for q=NEXTN+1.
+    q = NEXTN + 1 if mtp else 1
+    measured = os.environ.get(f"F_STAGE_Q{q}_MS")
+    if measured:
+        kwargs["afd_moe_time_ms"] = float(measured)
+    return cli_estimate(**kwargs)
+
+
+def raw_service_ms(result, mtp):
+    raw = result.raw.get("decode_batch_service_time_ms")
+    if raw is not None:
+        return float(raw)
+    progress = 1.0 + (expected_accepted(RATES) if mtp else 0.0)
+    return float(result.tpot) * progress
+
+
+summary = {}
+for topology, runner in (("agg", run_agg), ("afd", run_afd)):
+    for mtp in (False, True):
+        name = topology + ("_mtp" if mtp else "")
+        result = runner(mtp)
+        service_ms = raw_service_ms(result, mtp)
+        summary[name] = {
+            "effective_tpot_ms": float(result.tpot),
+            "raw_decode_round_ms": service_ms,
+            "tokens_s": float(result.raw.get("tokens/s", 0.0))
+            * (STATIC_REPLICAS if topology == "agg" else 1),
+            "tokens_s_gpu": float(result.raw.get("tokens/s/gpu", 0.0)),
+        }
+
+        # Fixed-case profile. Both axes bracket only this workload envelope.
+        # Use a denser grid before replaying a broad batch/context sweep.
+        profile_batch = (
+            STATIC_BATCH_PER_REPLICA if topology == "agg" else GLOBAL_BATCH
+        )
+        profile = Path(f"/tmp/{name}.npz")
+        np.savez(
+            profile,
+            prefill_isl=np.array([0.0, float(profile_batch * CONTEXT)]),
+            prefill_ttft_ms=np.array([0.0, 1.0]),
+            decode_active_kv_tokens=np.array(
+                [0.0, float(profile_batch * (CONTEXT + OUTPUT_TOKENS))]
+            ),
+            decode_context_length=np.array(
+                [float(CONTEXT), float(CONTEXT + OUTPUT_TOKENS)]
+            ),
+            decode_itl=np.full((2, 2), service_ms),
+        )
+
+print(json.dumps(summary, indent=2, sort_keys=True))
+print(f"global_batch={GLOBAL_BATCH}")
 PY
 ```
 
-The 8K example should produce:
+The fixed profile intentionally isolates decode. Its 1 ms prefill placeholder
+must not be used to report TTFT. Replace the prefill table with measured or AIC
+prefill points when TTFT is part of the experiment.
 
-```text
-resident_requests=6528
-microbatch_period_ms=21.469000000
-decode_batch_service_time_ms=42.937830353
-```
-
-Mocker must use `decode_batch_service_time_ms`. Do not export `result.tpot`,
-which represents one microbatch pipeline period.
-
-## 5. Run Mocker
-
-One logical Mocker worker represents the complete A+F domain. Therefore this
-case uses one worker with a domain-wide batch of 6528, not a batch of 96.
+## 4. Replay Any of the Four Modes
 
 ```bash
-export DYNAMO=~/afd-repro/dynamo
-export B_TOTAL=$((A_NODES * 4 * PER_A_GPU_BATCH))
-export TOTAL_GPUS=$(((A_NODES + F_NODES) * 4))
-export PREFILL_TOKENS=$((B_TOTAL * CONTEXT))
-export REQUIRED_TOKENS=$((B_TOTAL * (CONTEXT + OUTPUT_TOKENS)))
-export NUM_BLOCKS=$(((REQUIRED_TOKENS + 63) / 64 + 2 * B_TOTAL))
-export REPORT=/tmp/afd_8k_17a1f_mocker.json
+export DYNAMO=$PWD/../dynamo
+export GLOBAL_BATCH=$((17 * 4 * 96))
+export BLOCK_SIZE=64
 
-ENGINE_ARGS=$(printf \
-  '{"engine_type":"vllm","num_gpu_blocks":%d,"block_size":64,"max_num_seqs":%d,"max_num_batched_tokens":%d,"enable_prefix_caching":false,"enable_chunked_prefill":false,"planner_profile_data":"%s"}' \
-  "$NUM_BLOCKS" "$B_TOTAL" "$PREFILL_TOKENS" "$PROFILE")
-
-cd "$DYNAMO"
-"$DYNAMO/.venv/bin/python" -m dynamo.replay \
-  --input-tokens "$CONTEXT" \
-  --output-tokens "$OUTPUT_TOKENS" \
-  --request-count "$B_TOTAL" \
-  --replay-concurrency "$B_TOTAL" \
-  --num-workers 1 \
-  --replay-mode offline \
-  --router-mode round_robin \
-  --extra-engine-args "$ENGINE_ARGS" \
-  --report-json "$REPORT"
-```
-
-Check the steady-state result:
-
-```bash
-python - <<'PY'
-import json
+run_case () {
+  mode=$1
+  profile=/tmp/${mode}.npz
+  if [[ "$mode" == agg* ]]; then
+    workers=18
+    worker_batch=$(((GLOBAL_BATCH + workers - 1) / workers))
+  else
+    workers=1
+    worker_batch=$GLOBAL_BATCH
+  fi
+  worker_blocks=$(
+    GLOBAL_BATCH="$worker_batch" python - <<'PY'
 import os
-
-report = json.load(open(os.environ["REPORT"], encoding="utf-8"))
-batch = int(os.environ["B_TOTAL"])
-gpus = int(os.environ["TOTAL_GPUS"])
-itl_ms = float(report["mean_itl_ms"])
-
-print(f"completed_requests={report['completed_requests']}")
-print(f"mocker_mean_itl_ms={itl_ms:.9f}")
-print(f"steady_tokens_s_gpu={batch * 1000 / (itl_ms * gpus):.3f}")
+b = int(os.environ["GLOBAL_BATCH"])
+s = int(os.environ["CONTEXT"]) + int(os.environ["OUTPUT_TOKENS"])
+block = int(os.environ["BLOCK_SIZE"])
+print((b * s + block - 1) // block + 2 * b)
 PY
+  )
+  mtp_json=
+  if [[ "$mode" == *_mtp ]]; then
+    mtp_json=$(printf \
+      ',"aic_nextn":%d,"aic_nextn_accept_rates":"%s"' \
+      "$MTP_NEXTN" "$MTP_ACCEPT_RATES")
+  fi
+
+  engine_args=$(printf \
+    '{"engine_type":"vllm","num_gpu_blocks":%d,"block_size":%d,"max_num_seqs":%d,"max_num_batched_tokens":%d,"enable_prefix_caching":false,"enable_chunked_prefill":false%s,"aic_mtp_seed":42,"planner_profile_data":"%s"}' \
+    "$worker_blocks" "$BLOCK_SIZE" "$worker_batch" \
+    "$((worker_batch * CONTEXT))" "$mtp_json" "$profile")
+
+  "$DYNAMO/.venv/bin/python" -m dynamo.replay \
+    --input-tokens "$CONTEXT" \
+    --output-tokens "$OUTPUT_TOKENS" \
+    --request-count "$GLOBAL_BATCH" \
+    --replay-concurrency "$GLOBAL_BATCH" \
+    --num-workers "$workers" \
+    --replay-mode offline \
+    --router-mode round_robin \
+    --extra-engine-args "$engine_args" \
+    --report-json "/tmp/${mode}_mocker.json"
+}
+
+run_case agg
+run_case afd
+run_case agg_mtp
+run_case afd_mtp
 ```
 
-The 8K example should produce approximately:
-
-```text
-completed_requests=6528
-mocker_mean_itl_ms=42.937830000
-steady_tokens_s_gpu=2111.580
-```
-
-Mocker's finite-length `Output Token Throughput` includes startup and shutdown
-boundaries. For a steady-state comparison with FastAFD or AIC, use the
-tokens/s/GPU value reconstructed from `mean_itl_ms` above.
-
-For the 16K case, set `CONTEXT=16384` and `PER_A_GPU_BATCH=48`, then provide
-the matching `F_STAGE_MS`. Every A/F ratio must use its own measured F-stage
-time. Do not reuse one ratio's F-stage time across an entire sweep.
+Use the AIC-direct results for fixed-resident compute comparison. Use the
+Mocker reports for request-level throughput and latency under the configured
+scheduler. The two comparisons must use the same global batch, hardware
+budget, context, verification width, and acceptance-rate contract.
