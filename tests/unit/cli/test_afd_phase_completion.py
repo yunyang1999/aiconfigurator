@@ -397,7 +397,14 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
     )
 
     def fake_sum(self, ops, **kwargs):
-        queried_batches.append((ops[0]._name, kwargs["batch_size"]))
+        queried_batches.append(
+            (
+                ops[0]._name,
+                kwargs["batch_size"],
+                kwargs.get("sequence_batch_size"),
+                kwargs.get("query_len"),
+            )
+        )
         return 1.0, {ops[0]._name: 1.0}
 
     class FakeComm:
@@ -450,7 +457,7 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
         afd_config=cfg,
     )
 
-    session._simulate_phase(
+    metrics = session._simulate_phase(
         phase="decode",
         runtime_config=RuntimeConfig(isl=99, osl=2),
         a_model=SimpleNamespace(_num_layers=2, _nextn=2),
@@ -459,12 +466,13 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
         max_seq_len=None,
     )
 
-    # A microbatch is 8 / 2 = 4 requests. The F pool receives all four
-    # A-worker microbatches, so its baseline is 16 requests. nextn=2 verifies
-    # three target tokens per request on both pools.
+    # A microbatch is 8 / 2 = 4 requests. Dense A-side work sees 12 target
+    # tokens, but generation attention keeps four sequences with query_len=3
+    # so their KV prefixes are shared. The F pool receives all four A-worker
+    # microbatches, so its expanded token batch is 48.
     assert queried_batches == [
-        ("generation_attention", 12),
-        ("generation_moe", 48),
+        ("generation_attention", 12, 4, 3),
+        ("generation_moe", 48, None, None),
     ]
     assert queried_transfers == [
         ("a2f", 12),
@@ -473,6 +481,9 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
         ("f_rs", 12),
         ("a_combine", 12),
     ]
+    assert metrics["verification_width"] == 3
+    assert metrics["a_verification_tokens_per_microbatch"] == 12
+    assert metrics["f_verification_tokens_per_microbatch"] == 48
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0, math.inf, math.nan])

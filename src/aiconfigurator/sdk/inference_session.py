@@ -983,6 +983,8 @@ class AFDInferenceSession:
         ops_iter,
         *,
         batch_size: int,
+        sequence_batch_size: int | None = None,
+        query_len: int = 1,
         seq_len: int,
         model,
         runtime_config: config.RuntimeConfig,
@@ -991,9 +993,11 @@ class AFDInferenceSession:
         """Sum the query() latencies for a list of ops, returning (total, per-op dict).
 
         For prefill (``is_context=True``) we pass ``seq_imbalance_correction_scale``;
-        for decode we pass ``gen_seq_imbalance_correction_scale``.  Tokens
-        processed per call = ``batch_size`` for decode, ``batch_size*seq_len``
-        for prefill (one token per sequence vs. full sequence).
+        for decode we pass ``gen_seq_imbalance_correction_scale``. ``batch_size``
+        is the token batch used by dense/MoE ops. During speculative verification,
+        generation attention instead receives ``sequence_batch_size`` and
+        ``query_len`` so it can model several causal query tokens sharing one KV
+        prefix rather than treating them as independent sequences.
         """
         x = batch_size * seq_len if is_context else batch_size
 
@@ -1012,7 +1016,15 @@ class AFDInferenceSession:
 
         per_op = defaultdict(float)
         for op in ops_iter:
-            result = op.query(self._database, **kwargs_common)
+            op_kwargs = kwargs_common
+            if not is_context and query_len > 1:
+                from aiconfigurator.sdk.operations import GenerationAttention
+
+                if isinstance(op, GenerationAttention):
+                    op_kwargs = dict(kwargs_common)
+                    op_kwargs["batch_size"] = sequence_batch_size if sequence_batch_size is not None else batch_size
+                    op_kwargs["query_len"] = query_len
+            result = op.query(self._database, **op_kwargs)
             per_op[op._name] += float(result)
         return sum(per_op.values()), per_op
 
@@ -1374,6 +1386,8 @@ class AFDInferenceSession:
         isl: int,
         osl: int,
         a_batch_size: int,
+        a_sequence_batch_size: int,
+        a_query_len: int,
         b_batch_size: int,
         num_layers: int,
         brk_t_a_per_layer: float,
@@ -1406,7 +1420,6 @@ class AFDInferenceSession:
         time.
         """
         stride = self._AFD_DECODE_STRIDE
-        verify_width = self._nextn + 1
 
         t_a_layer_sum = 0.0
         t_f_layer_sum = 0.0
@@ -1429,7 +1442,9 @@ class AFDInferenceSession:
 
             t_a_step_i, a_per_op_i = self._sum_latency(
                 a_partition.attn_ops,
-                batch_size=a_batch_size * verify_width,
+                batch_size=a_batch_size,
+                sequence_batch_size=a_sequence_batch_size,
+                query_len=a_query_len,
                 seq_len=s_i,
                 model=a_model,
                 runtime_config=runtime_config,
@@ -1438,7 +1453,7 @@ class AFDInferenceSession:
             if afd_moe_time_ms is None:
                 t_f_step_i, f_per_op_i = self._sum_latency(
                     f_partition.ffn_ops,
-                    batch_size=b_batch_size * verify_width,
+                    batch_size=b_batch_size,
                     seq_len=s_i,
                     model=f_model,
                     runtime_config=runtime_config,
@@ -1654,9 +1669,13 @@ class AFDInferenceSession:
                 isl=isl,
                 osl=osl,
                 # Speculative verification evaluates nextn+1 target tokens per
-                # active request.  The model op scales separately account for
-                # the draft-layer work.
+                # active request. Dense ops use the expanded token batch, while
+                # generation attention keeps the request batch and receives the
+                # verification width explicitly so the shared KV prefix is not
+                # charged once per candidate token.
                 a_batch_size=a_micro_batch_size * verification_width,
+                a_sequence_batch_size=a_micro_batch_size,
+                a_query_len=verification_width,
                 b_batch_size=b_micro_total * verification_width,
                 num_layers=num_layers,
                 brk_t_a_per_layer=brk_t_a_per_layer,
@@ -1750,6 +1769,11 @@ class AFDInferenceSession:
             "a_is_kv_cache_oom": a_memory_summary.check_kv_cache_oom(),
             "f_is_kv_cache_oom": f_memory_summary.check_kv_cache_oom(),
             "num_layers": num_layers,
+            "verification_width": verification_width if phase == "decode" else 1,
+            "a_verification_tokens_per_microbatch": (
+                a_micro_batch_size * verification_width if phase == "decode" else 0
+            ),
+            "f_verification_tokens_per_microbatch": (b_micro_total * verification_width if phase == "decode" else 0),
             "a_partition": a_partition,
             "f_partition": f_partition,
         }
@@ -2028,6 +2052,17 @@ class AFDInferenceSession:
             "(a)tp": cfg.tp_a,
             "(a)bs": cfg.a_batch_size,
             "(a)micro_bs": a_micro_batch_size,
+            "verification_width": decode_metrics.get("verification_width", 1) if decode_metrics is not None else 1,
+            "a_verification_tokens_per_microbatch": (
+                decode_metrics.get("a_verification_tokens_per_microbatch", a_micro_batch_size)
+                if decode_metrics is not None
+                else 0
+            ),
+            "f_verification_tokens_per_microbatch": (
+                decode_metrics.get("f_verification_tokens_per_microbatch", b_micro_total)
+                if decode_metrics is not None
+                else 0
+            ),
             "(a)workers": cfg.n_a_workers,
             "(a)memory": round(a_memory_gb, 2),
             "(a)is_oom": bool(a_is_oom),
@@ -2069,6 +2104,12 @@ class AFDInferenceSession:
             "ttft": round(ttft, 3),
             "tpot": round(tpot, 3),
             "decode_batch_service_time_ms": decode_batch_service_time_ms,
+            # Raw full-batch verification service stays in iteration units.
+            # The speculative projection below derives the accepted-output-token
+            # equivalent without destroying the raw value needed by a burst-aware
+            # simulator such as Dynamo Mocker.
+            "effective_decode_batch_service_time_ms": decode_batch_service_time_ms,
+            "expected_output_tokens_per_decode_iteration": 1.0,
             "request_latency": round(request_latency, 3),
             "b_total": b_total,
             "b_micro_total": b_micro_total,

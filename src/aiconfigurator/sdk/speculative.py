@@ -101,6 +101,10 @@ class SpeculativeDecodingProfile:
             frame["tpot"] = frame["tpot"] / progress
         if "generation_latency" in frame:
             frame["generation_latency"] = frame["generation_latency"] / progress
+        if "decode_batch_service_time_ms" in frame:
+            frame["effective_decode_batch_service_time_ms"] = frame["decode_batch_service_time_ms"] / progress
+        if "expected_output_tokens_per_decode_iteration" in frame:
+            frame["expected_output_tokens_per_decode_iteration"] = progress
 
         if {"ttft", "tpot", "osl"}.issubset(frame.columns):
             frame["request_latency"] = frame["ttft"] + frame["tpot"] * (frame["osl"] - 1).clip(lower=0)

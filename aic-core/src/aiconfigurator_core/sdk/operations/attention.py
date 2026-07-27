@@ -881,6 +881,73 @@ class GenerationAttention(Operation):
     # Op contract: query() + get_weights()
     # ------------------------------------------------------------------
 
+    def _verification_roofline_scale(
+        self,
+        database: PerfDatabase,
+        *,
+        batch_size: int,
+        s: int,
+        query_len: int,
+    ) -> float:
+        """Scale a measured q_len=1 decode point to a fused verification block.
+
+        Generation-attention tables use ``(batch, sequence_length)`` and contain
+        one query token per sequence. Speculative verification instead evaluates
+        ``query_len`` causal query tokens against one shared prefix. Treating
+        those tokens as additional sequences rereads the prefix ``query_len``
+        times and loses the kernel's within-block KV reuse.
+
+        The q_len=1 table remains the calibration anchor. The scale is the ratio
+        of q-wide and q_len=1 roofline bounds, including causal work among the
+        new query tokens and one read of their shared KV prefix.
+        """
+        base_sol, _, _ = database.query_generation_attention(
+            batch_size,
+            s,
+            self._n,
+            self._n_kv,
+            self._kv_cache_dtype,
+            database_mode=common.DatabaseMode.SOL_FULL,
+            window_size=self._window_size,
+            head_size=self._head_size,
+        )
+
+        # Match the q_len=1 database contract, where the first query reads
+        # ``s - 1`` cached KV positions. Later queries add prior draft tokens.
+        prefix_len = max(s - 1, 0)
+        spans: list[int] = []
+        existing_prefix_spans: list[int] = []
+        new_token_spans: list[int] = []
+        for offset in range(query_len):
+            span = prefix_len + offset
+            if self._window_size > 0:
+                span = min(span, self._window_size)
+            existing = min(prefix_len, max(span - min(offset, span), 0))
+            spans.append(span)
+            existing_prefix_spans.append(existing)
+            new_token_spans.append(span - existing)
+
+        existing_union = existing_prefix_spans[0]
+        new_union = min(query_len - 1, sum(new_token_spans))
+        kv_positions_read = existing_union + new_union
+
+        # Match the q_len=1 SOL contract above: two attention GEMMs, with FMA
+        # counted as two FLOPs, and BF16 query/output tensors.
+        ops = 4 * batch_size * self._n * self._head_size * sum(spans)
+        kv_bytes = batch_size * 2 * self._n_kv * self._head_size * self._kv_cache_dtype.value.memory * kv_positions_read
+        query_output_bytes = batch_size * query_len * 2 * self._n * self._head_size * 2
+        mem_bytes = kv_bytes + query_output_bytes
+
+        quant_mode = (
+            common.FMHAQuantMode.fp8
+            if self._kv_cache_dtype == common.KVCacheQuantMode.fp8
+            else common.FMHAQuantMode.bfloat16
+        )
+        sol_math = ops / database.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / quant_mode.value.compute
+        sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+        verification_sol = max(sol_math, sol_mem)
+        return verification_sol / max(float(base_sol), 1e-12)
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query generation attention latency with energy data."""
         beam_width = kwargs.get("beam_width")
@@ -888,6 +955,10 @@ class GenerationAttention(Operation):
             raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
         batch_size = kwargs.get("batch_size")
         s = kwargs.get("s")
+        query_len = kwargs.get("query_len", 1)
+        if isinstance(query_len, bool) or int(query_len) != query_len or int(query_len) < 1:
+            raise ValueError(f"query_len must be a positive integer, got {query_len!r}")
+        query_len = int(query_len)
 
         result = database.query_generation_attention(
             batch_size,
@@ -898,6 +969,19 @@ class GenerationAttention(Operation):
             window_size=self._window_size,
             head_size=self._head_size,
         )
+        if query_len > 1:
+            roofline_scale = self._verification_roofline_scale(
+                database,
+                batch_size=batch_size,
+                s=s,
+                query_len=query_len,
+            )
+            source = "sol" if getattr(result, "source", "silicon") == "sol" else "estimated"
+            result = PerformanceResult(
+                float(result) * roofline_scale,
+                energy=result.energy * roofline_scale,
+                source=source,
+            )
         gen_seq_imbalance_correction_scale = float(
             kwargs.get(
                 "gen_seq_imbalance_correction_scale",

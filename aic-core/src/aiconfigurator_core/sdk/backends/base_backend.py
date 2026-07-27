@@ -364,21 +364,29 @@ class BaseBackend:
         generation_energy_wms_dict = defaultdict(float)
         generation_source_dict: dict[str, str] = {}
 
-        batch_size = batch_size * (model._nextn + 1)
+        sequence_batch_size = batch_size
+        verification_width = model._nextn + 1
+        token_batch_size = sequence_batch_size * verification_width
 
         for i in range(0, osl - 1, stride):
             latency_dict = defaultdict(float)
             energy_wms_dict = defaultdict(float)
 
             for op in model.generation_ops:
-                result = op.query(
-                    database,
-                    x=batch_size * beam_width,
-                    batch_size=batch_size,
-                    beam_width=beam_width,
-                    s=isl + i + 1,
-                    gen_seq_imbalance_correction_scale=runtime_config.gen_seq_imbalance_correction_scale,
-                )
+                kwargs = {
+                    "x": token_batch_size * beam_width,
+                    "batch_size": token_batch_size,
+                    "beam_width": beam_width,
+                    "s": isl + i + 1,
+                    "gen_seq_imbalance_correction_scale": runtime_config.gen_seq_imbalance_correction_scale,
+                }
+                if verification_width > 1:
+                    from aiconfigurator_core.sdk.operations import GenerationAttention
+
+                    if isinstance(op, GenerationAttention):
+                        kwargs["batch_size"] = sequence_batch_size
+                        kwargs["query_len"] = verification_width
+                result = op.query(database, **kwargs)
                 latency_dict[op._name] += float(result)
                 energy_wms_dict[op._name] += getattr(result, "energy", 0.0)
                 new_src = getattr(result, "source", "silicon")

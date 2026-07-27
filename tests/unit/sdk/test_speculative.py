@@ -31,6 +31,9 @@ def _summary() -> InferenceSummary:
         "tokens/s/gpu": 11.25,
         "tokens/s/user": 100.0,
         "generation_latency": 80.0,
+        "decode_batch_service_time_ms": 30.0,
+        "effective_decode_batch_service_time_ms": 30.0,
+        "expected_output_tokens_per_decode_iteration": 1.0,
         "memory": 42.0,
     }
     summary.set_summary_df(pd.DataFrame([row]))
@@ -73,6 +76,9 @@ def test_expected_progress_projects_service_metrics_not_core_breakdown():
     assert row["tokens/s"] == 90.0
     assert row["tokens/s/user"] == 200.0
     assert row["generation_latency"] == 40.0
+    assert row["decode_batch_service_time_ms"] == 30.0
+    assert row["effective_decode_batch_service_time_ms"] == 15.0
+    assert row["expected_output_tokens_per_decode_iteration"] == 2.0
     assert row["memory"] == 42.0
 
     # The raw per-operation iteration cost from aic-core remains available and the
