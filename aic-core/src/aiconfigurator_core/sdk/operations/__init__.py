@@ -18,9 +18,11 @@ from __future__ import annotations
 
 from aiconfigurator_core.sdk.operations.afd_transfer import (
     AFDCombine,
+    AFDCombineFastAFD,
     AFDFAllGather,
     AFDFReduceScatter,
     AFDTransfer,
+    AFDTransferFastAFD,
     _afd_send_prob,
 )
 from aiconfigurator_core.sdk.operations.attention import ContextAttention, EncoderAttention, GenerationAttention
@@ -60,9 +62,11 @@ __all__ = [
     "NCCL",
     "P2P",
     "AFDCombine",
+    "AFDCombineFastAFD",
     "AFDFAllGather",
     "AFDFReduceScatter",
     "AFDTransfer",
+    "AFDTransferFastAFD",
     "ContextAttention",
     "ContextDSAModule",
     "ContextDeepSeekV4AttentionModule",

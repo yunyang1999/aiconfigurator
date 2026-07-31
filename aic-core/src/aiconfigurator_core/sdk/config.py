@@ -260,6 +260,15 @@ class AFDConfig:
     # partition instead.
     boundary_on_attn: bool = True
 
+    # Which cross-pool communication model to price the A<->F boundary with.
+    #   "pr1323"  -- the model as merged in PR #1323 (symmetric legs, one
+    #                destination billed, expert shard = node, F-node AG/RS)
+    #   "fastafd" -- calibrated against hao-ai-lab/FastAFD: sums over
+    #                destinations, expert shard = rank, FP8 out / BF16 back,
+    #                incast-aware, and no F-side token AllGather/ReduceScatter
+    #                because the F pool runs pure EP.
+    comm_model: str = "pr1323"
+
     # -- Derived (set in __post_init__) --
     n_a_workers: int = field(init=False)
     n_f_workers: int = field(init=False)
@@ -271,6 +280,9 @@ class AFDConfig:
             raise ValueError(f"phase must be one of {valid_phases}, got {self.phase!r}.")
         if self.pipeline_model not in valid_pipeline_models:
             raise ValueError(f"pipeline_model must be one of {valid_pipeline_models}, got {self.pipeline_model!r}.")
+        valid_comm_models = ("pr1323", "fastafd")
+        if self.comm_model not in valid_comm_models:
+            raise ValueError(f"comm_model must be one of {valid_comm_models}, got {self.comm_model!r}.")
         if self.n_a_nodes < 1 or self.n_f_nodes < 1:
             raise ValueError(f"n_a_nodes ({self.n_a_nodes}) and n_f_nodes ({self.n_f_nodes}) must both be >= 1.")
         if self.a_batch_size < 1:
