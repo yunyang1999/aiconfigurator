@@ -1010,6 +1010,7 @@ def afd_pareto(
     decode_degradation: float = _AFD_DECODE_DEGRADATION,
     ttft_correction_factor: float = _AFD_TTFT_CORRECTION_FACTOR,
     decode_latency_correction: float = 1.0,
+    comm_model: str = "pr1323",
 ) -> pd.DataFrame:
     """Sweep AFD candidate topologies and collect per-candidate estimates.
 
