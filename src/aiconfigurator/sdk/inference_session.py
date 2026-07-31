@@ -1544,9 +1544,11 @@ class AFDInferenceSession:
         cfg = self._afd_config
         ops_phase = "context" if phase == "prefill" else "generation"
         if phase == "decode" and self._nextn > 0:
-            logger.warning(
-                "AFD MTP nextn=%d uses batch widening by nextn+1 for parity with the base backend. "
-                "This is an approximation: verify positions share sequence KV history.",
+            logger.info(
+                "AFD MTP nextn=%d: dense/MoE ops are widened by nextn+1 for parity with the "
+                "base backend, while generation attention keeps the sequence batch and is "
+                "scaled by the q-wide verification roofline so the shared KV prefix is read "
+                "once rather than once per candidate token.",
                 self._nextn,
             )
         # Boundary ops (``add_norm_2`` / ``logits_gemm``) default to the
