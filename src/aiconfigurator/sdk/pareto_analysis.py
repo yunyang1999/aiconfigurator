@@ -1281,6 +1281,7 @@ def afd_pareto(
                         phase="decode",
                         combined_with_pd=bool(combined_with_pd),
                         boundary_on_attn=bool(boundary_on_attn),
+                        comm_model=str(comm_model),
                     )
                     candidate_runtime_config = copy.deepcopy(eval_runtime_config)
                     candidate_runtime_config.batch_size = afd_config.n_a_workers * afd_config.a_batch_size
@@ -1410,6 +1411,7 @@ def afd_pareto(
                             phase="decode",
                             combined_with_pd=bool(combined_with_pd),
                             boundary_on_attn=bool(boundary_on_attn),
+                            comm_model=str(comm_model),
                         )
 
                         candidate_runtime_config = copy.deepcopy(eval_runtime_config)
