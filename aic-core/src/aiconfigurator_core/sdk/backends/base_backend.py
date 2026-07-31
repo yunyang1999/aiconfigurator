@@ -381,10 +381,20 @@ class BaseBackend:
                     "gen_seq_imbalance_correction_scale": runtime_config.gen_seq_imbalance_correction_scale,
                 }
                 if verification_width > 1:
-                    from aiconfigurator_core.sdk.operations import GenerationAttention
+                    from aiconfigurator_core.sdk.operations import (
+                        SPECULATIVE_ATTENTION_OPS,
+                        contains_speculative_attention,
+                    )
 
-                    if isinstance(op, GenerationAttention):
+                    if isinstance(op, SPECULATIVE_ATTENTION_OPS):
                         kwargs["batch_size"] = sequence_batch_size
+                        kwargs["query_len"] = verification_width
+                    elif contains_speculative_attention(op):
+                        # Wrapper (FallbackOp / OverlapOp): its other inner ops
+                        # really do process the widened token batch, so keep
+                        # `batch_size` and let the attention leaf pick the
+                        # sequence batch out of the extra key.
+                        kwargs["sequence_batch_size"] = sequence_batch_size
                         kwargs["query_len"] = verification_width
                 result = op.query(database, **kwargs)
                 latency_dict[op._name] += float(result)

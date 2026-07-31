@@ -57,6 +57,38 @@ from aiconfigurator_core.sdk.operations.overlap import FallbackOp, OverlapOp
 # ``from aiconfigurator_core.sdk.operations import PerformanceResult``.
 from aiconfigurator_core.sdk.performance_result import PerformanceResult
 
+
+# --------------------------------------------------------------------------- #
+# Speculative verification: which ops price a shared KV prefix
+# --------------------------------------------------------------------------- #
+
+#: Leaf ops whose cost depends on the *sequence* batch and the verification
+#: width, not on the widened token batch. Under speculative decoding the
+#: ``query_len`` verification tokens share one KV prefix, so charging them as
+#: independent sequences rereads that prefix ``query_len`` times.
+SPECULATIVE_ATTENTION_OPS = (GenerationAttention, GenerationMLA)
+
+
+def contains_speculative_attention(op) -> bool:
+    """True if ``op`` is, or wraps, an op that needs ``query_len``.
+
+    Attention is not always a bare op: DeepSeek-family models emit the whole
+    MLA block as a ``FallbackOp`` whose fallback list holds the GEMMs, the
+    BMMs and ``GenerationMLA``. An ``isinstance`` test on the outer op misses
+    those, which is how MLA models kept getting batch-widened verification.
+    """
+    if isinstance(op, SPECULATIVE_ATTENTION_OPS):
+        return True
+    inner = (
+        list(getattr(op, "_group_a", []))
+        + list(getattr(op, "_group_b", []))
+        + list(getattr(op, "_fallback", []))
+    )
+    primary = getattr(op, "_primary", None)
+    if primary is not None:
+        inner.append(primary)
+    return any(contains_speculative_attention(child) for child in inner)
+
 __all__ = [
     "GEMM",
     "NCCL",
@@ -97,9 +129,11 @@ __all__ = [
     "TrtLLMWideEPMoE",
     "TrtLLMWideEPMoEDispatch",
     "WideEPContextMLA",
+    "SPECULATIVE_ATTENTION_OPS",
     "WideEPGenerationMLA",
     "_BaseDeepSeekV4AttentionModule",
     "_afd_send_prob",
     "clear_all_op_caches",
+    "contains_speculative_attention",
     "warm_all_op_data",
 ]

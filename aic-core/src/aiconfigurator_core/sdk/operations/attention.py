@@ -959,6 +959,12 @@ class GenerationAttention(Operation):
         if isinstance(query_len, bool) or int(query_len) != query_len or int(query_len) < 1:
             raise ValueError(f"query_len must be a positive integer, got {query_len!r}")
         query_len = int(query_len)
+        if query_len > 1:
+            # Wrappers (FallbackOp / OverlapOp) forward one kwargs set to every
+            # inner op, so the token batch stays correct for the surrounding
+            # GEMMs while attention picks the sequence batch out of the extra
+            # key. A bare op is handed the sequence batch directly.
+            batch_size = kwargs.get("sequence_batch_size") or batch_size
 
         result = database.query_generation_attention(
             batch_size,

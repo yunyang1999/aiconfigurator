@@ -421,6 +421,56 @@ class GenerationMLA(Operation):
     # Op contract
     # ------------------------------------------------------------------
 
+    def _verification_roofline_scale(
+        self,
+        database: PerfDatabase,
+        *,
+        batch_size: int,
+        s: int,
+        query_len: int,
+    ) -> float:
+        """Scale a measured q_len=1 MLA decode point to a fused verification block.
+
+        Mirrors ``GenerationAttention._verification_roofline_scale``. MLA's
+        latent KV is shared across heads, so the ``q`` verification tokens read
+        one compressed prefix rather than ``q`` copies of it; treating them as
+        extra sequences rereads that prefix ``q`` times.
+
+        The arithmetic reproduces the q_len=1 SOL in ``_query_generation_mla_table``
+        term for term -- ``1088`` absorbed channels per head for the two attention
+        GEMMs and the query/output tensors, ``576`` latent channels per cached
+        position, and that table's convention of counting ``s`` positions for FLOPs
+        but ``s - 1`` for cache traffic -- so the ratio is exactly 1.0 at
+        ``query_len == 1``.
+        """
+        base_sol, _, _ = database.query_generation_mla(
+            batch_size,
+            s,
+            self._num_heads,
+            self._kv_cache_dtype,
+            database_mode=common.DatabaseMode.SOL_FULL,
+        )
+
+        spans = [s + offset for offset in range(query_len)]
+        # Cache traffic: one read of the shared prefix plus the draft tokens
+        # that earlier verification positions append.
+        kv_positions_read = max(s - 1, 0) + (query_len - 1)
+
+        quant_mode = (
+            common.FMHAQuantMode.fp8
+            if self._kv_cache_dtype == common.KVCacheQuantMode.fp8
+            else common.FMHAQuantMode.bfloat16
+        )
+        ops = 2 * batch_size * self._num_heads * 1088 * sum(spans)
+        mem_bytes = batch_size * (
+            query_len * self._num_heads * 1088 * 2
+            + kv_positions_read * 576 * self._kv_cache_dtype.value.memory
+        )
+        sol_math = ops / database.system_spec["gpu"]["bfloat16_tc_flops"] * 1000 / quant_mode.value.compute
+        sol_mem = mem_bytes / database.system_spec["gpu"]["mem_bw"] * 1000
+        verification_sol = max(sol_math, sol_mem)
+        return verification_sol / max(float(base_sol), 1e-12)
+
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         """Query generation MLA latency with energy data."""
         beam_width = kwargs.get("beam_width")
@@ -428,8 +478,31 @@ class GenerationMLA(Operation):
             raise ValueError(f"{self.__class__.__name__} only supports beam_width=1, got {beam_width}")
         batch_size = kwargs.get("batch_size")
         s = kwargs.get("s")
+        query_len = kwargs.get("query_len", 1)
+        if isinstance(query_len, bool) or int(query_len) != query_len or int(query_len) < 1:
+            raise ValueError(f"query_len must be a positive integer, got {query_len!r}")
+        query_len = int(query_len)
+        if query_len > 1:
+            # Wrappers (FallbackOp / OverlapOp) forward one kwargs set to every
+            # inner op, so the token batch stays correct for the surrounding
+            # GEMMs/BMMs while attention picks the sequence batch out of the
+            # extra key. A bare op is handed the sequence batch directly.
+            batch_size = kwargs.get("sequence_batch_size") or batch_size
 
         result = database.query_generation_mla(batch_size, s, self._num_heads, self._kv_cache_dtype)
+        if query_len > 1:
+            roofline_scale = self._verification_roofline_scale(
+                database,
+                batch_size=batch_size,
+                s=s,
+                query_len=query_len,
+            )
+            source = "sol" if getattr(result, "source", "silicon") == "sol" else "estimated"
+            result = PerformanceResult(
+                float(result) * roofline_scale,
+                energy=result.energy * roofline_scale,
+                source=source,
+            )
         return PerformanceResult(
             float(result) * self._scale_factor,
             energy=result.energy * self._scale_factor,
