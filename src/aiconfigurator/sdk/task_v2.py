@@ -601,6 +601,10 @@ class Task:
     afd_combined_with_pd: bool = True
     afd_comm_overhead_factor: float = 1.0
     afd_boundary_on_attn: bool = True
+    # Which cross-pool communication model to price the A<->F boundary with.
+    # "pr1323" keeps the model as merged; "fastafd" is the layout-aware one
+    # calibrated against hao-ai-lab/FastAFD. See AFDConfig.comm_model.
+    afd_comm_model: str = "pr1323"
     afd_total_batch_size: int | None = None
     # Per-A-worker ceiling for the automatic A-batch search.
     afd_max_a_batch_size: int = 1024
@@ -1900,6 +1904,7 @@ class Task:
             "combined_with_pd": self.afd_combined_with_pd,
             "comm_overhead_factor": self.afd_comm_overhead_factor,
             "boundary_on_attn": self.afd_boundary_on_attn,
+            "comm_model": self.afd_comm_model,
             "total_batch_size": self.afd_total_batch_size,
             "max_a_batch_size": self.afd_max_a_batch_size,
             "target_ttft": self.ttft,
@@ -2247,6 +2252,7 @@ class Task:
             f_moe_ep_size=f_moe_ep_size,
             comm_overhead_factor=self.afd_comm_overhead_factor,
             boundary_on_attn=self.afd_boundary_on_attn,
+            comm_model=self.afd_comm_model,
         )
 
         a_model_config = copy.deepcopy(base_model_config)

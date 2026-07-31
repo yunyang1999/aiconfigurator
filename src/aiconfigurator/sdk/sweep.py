@@ -1013,6 +1013,7 @@ def sweep_afd(
     decode_degradation: float | None = None,
     ttft_correction_factor: float | None = None,
     decode_latency_correction: float = 1.0,
+    comm_model: str = "pr1323",
 ) -> pd.DataFrame:
     """Sweep AFD candidate topologies; return feasible-candidate DataFrame.
 
@@ -1068,5 +1069,6 @@ def sweep_afd(
         decode_degradation=decode_degradation or _AFD_DECODE_DEGRADATION,
         ttft_correction_factor=ttft_correction_factor or _AFD_TTFT_CORRECTION_FACTOR,
         decode_latency_correction=decode_latency_correction,
+        comm_model=comm_model,
     )
     return result_df
