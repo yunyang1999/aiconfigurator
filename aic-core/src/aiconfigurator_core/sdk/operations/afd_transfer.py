@@ -48,6 +48,53 @@ def _afd_send_prob(num_experts: int, topk: int, num_f_nodes: int) -> float:
     return 1.0 - comb(n_other, topk) / comb(num_experts, topk)
 
 
+# --------------------------------------------------------------------------- #
+# FastAFD-calibrated communication model
+#
+# Structure taken from hao-ai-lab/FastAFD (minisgl + vendored DeepEP V2 /
+# DeepGEMM), which is a measured serving system, not an estimator:
+#
+#   * experts are partitioned per RANK, not per node
+#       moe/deepep_m2n_union.py   experts_per_union_rank = ceil(E / eg_size)
+#       impls/dispatch_deterministic_prologue.cuh
+#                                 kNumExpertsPerRank = E / kNumScaleupRanks
+#                                 map_expert_to_rank_idx(e) = e / kNumExpertsPerRank
+#   * one message per (token, destination rank), deduplicated -- same kernel:
+#       "Avoid duplicate messages to a single rank" / is_unique(rank_idx)
+#   * the two legs carry DIFFERENT payloads
+#       apis/mega_m2n.hpp  fp8_token_layout  = Data(hidden)      # A->F, e4m3
+#                          fp8_sf_layout     = Data(hidden / 32) # per-32 scales
+#                          bf16_token_layout = Data(hidden * 2)  # F->A
+#   * within one NVLink/NVSwitch domain DeepEP takes the DIRECT path
+#       elastic/buffer.hpp  `if (num_scaleout_ranks == 1) { // Direct dispatch }`
+#     so a token crosses the fabric once per destination RANK.  Only when the
+#     pool spans RDMA does the hybrid path kick in, where the token crosses the
+#     slow link once per destination NODE and is then forwarded over NVLink
+#       elastic/buffer.hpp  scaleout_send_buffer multiplicity == 1
+# --------------------------------------------------------------------------- #
+
+# A->F: FP8 e4m3 payload plus one UE8M0 scale per 32 elements.
+_FASTAFD_DISPATCH_BYTES_PER_ELEM = 1.0 + 1.0 / 32.0
+# F->A: BF16 partial results.
+_FASTAFD_COMBINE_BYTES_PER_ELEM = 2.0
+
+
+def _afd_reach(num_experts: int, topk: int, num_units: int) -> float:
+    """Expected number of distinct units a token must be sent to.
+
+    ``num_units`` is whatever the experts are sharded over -- ranks for the
+    NVLink-direct path, nodes for the RDMA hop of the hybrid path.  Equals
+    ``num_units * P(unit holds >=1 of the token's top-k experts)`` and is
+    therefore capped by ``min(topk, num_units)``.
+    """
+    units = max(int(num_units), 1)
+    if units <= 1:
+        return 1.0
+    if num_experts <= 0 or topk <= 0:  # dense: tokens are partitioned, not replicated
+        return 1.0
+    return units * _afd_send_prob(num_experts, topk, units)
+
+
 class AFDTransfer(Operation):
     """Unidirectional cross-pool P2P transfer (A→F **or** F→A).
 
@@ -320,6 +367,178 @@ class AFDCombine(Operation):
         tokens_per_a_rank = (x + self._tp_a - 1) // self._tp_a
         bpe = self._comm_quant_mode.value.memory
         total_bytes = int((self._f_moe_ep_size + 1) * tokens_per_a_rank * self._hidden_size * bpe)
+        if total_bytes <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        result = database.query_mem_op(total_bytes)
+        return PerformanceResult(
+            float(result) * self._scale_factor,
+            energy=result.energy * self._scale_factor,
+            source=getattr(result, "source", "silicon"),
+        )
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
+class AFDTransferFastAFD(Operation):
+    """Cross-pool transfer priced the way FastAFD actually moves bytes.
+
+    Differences from :class:`AFDTransfer` (see the module-level note for the
+    FastAFD source lines behind each one):
+
+    1. **Sums over destinations.** ``AFDTransfer`` charges the volume to a
+       single destination against one GPU's fabric port; a token actually
+       replicates to every unit holding one of its top-k experts.
+    2. **Dedups per rank, not per node.** Experts are sharded per rank, so the
+       fan-out is ``reach_rank``; the node-level count only bounds the RDMA hop
+       of the hybrid path.
+    3. **Direction-specific payload.** A->F is FP8 + per-32 scales, F->A is
+       BF16 -- roughly a 2x asymmetry that the symmetric model cannot express.
+    4. **Models incast.** An F-rank receives from every A-worker, so the F-side
+       ingress can dominate in the asymmetric M:N layouts AFD is built for.
+    """
+
+    _VALID_DIRECTIONS = ("a2f", "f2a")
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        direction: str,
+        hidden_size: int,
+        n_a_workers: int,
+        n_f_workers: int,
+        gpus_per_node: int = 8,
+        num_experts: int = 0,
+        topk: int = 0,
+        tp_a: int = 1,
+        comm_overhead_factor: float = 1.0,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        if direction not in self._VALID_DIRECTIONS:
+            raise ValueError(
+                f"AFDTransferFastAFD: direction must be one of {self._VALID_DIRECTIONS}, got {direction!r}"
+            )
+        self._direction = direction
+        self._hidden_size = int(hidden_size)
+        self._n_a_workers = max(int(n_a_workers), 1)
+        self._n_f_workers = max(int(n_f_workers), 1)
+        self._gpus_per_node = max(int(gpus_per_node), 1)
+        self._num_experts = max(int(num_experts), 0)
+        self._topk = max(int(topk), 0)
+        self._tp_a = max(int(tp_a), 1)
+        self._comm_overhead_factor = float(comm_overhead_factor or 1.0)
+        self._weights = 0.0
+
+    @property
+    def direction(self) -> str:
+        return self._direction
+
+    @property
+    def num_f_nodes(self) -> int:
+        return max((self._n_f_workers + self._gpus_per_node - 1) // self._gpus_per_node, 1)
+
+    @property
+    def bytes_per_elem(self) -> float:
+        """FP8+scales outbound, BF16 inbound -- the legs are not symmetric."""
+        return (
+            _FASTAFD_DISPATCH_BYTES_PER_ELEM
+            if self._direction == "a2f"
+            else _FASTAFD_COMBINE_BYTES_PER_ELEM
+        )
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        x = int(kwargs.get("x", 0))
+        if x <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+
+        node = database.system_spec["node"]
+        gpn = self._gpus_per_node
+        rack_gpus = node.get("num_gpus_per_rack", float("inf"))
+        latency = float(node.get("p2p_latency", 0.0))
+
+        reach_rank = _afd_reach(self._num_experts, self._topk, self._n_f_workers)
+        reach_node = _afd_reach(self._num_experts, self._topk, self.num_f_nodes)
+        payload = self._hidden_size * self.bytes_per_elem  # bytes per token per copy
+        total_tokens = x * self._n_a_workers               # global tokens this microbatch
+
+        a_gpus = self._n_a_workers * self._tp_a
+        total_gpus = a_gpus + self._n_f_workers
+        fabric_bw = float(database.system_spec.get_p2p_bandwidth(total_gpus))
+
+        if total_gpus <= rack_gpus:
+            # One NVLink/NVSwitch domain -> DeepEP's direct path: a token
+            # crosses the fabric once per destination RANK.
+            a_bytes = reach_rank * x * payload / self._tp_a          # per A-GPU
+            f_bytes = total_tokens * (reach_rank / self._n_f_workers) * payload  # per F-GPU
+            seconds = max(a_bytes, f_bytes) / fabric_bw + latency
+        else:
+            # Hybrid path: the slow link carries one copy per destination NODE,
+            # then NVLink fans out inside that node.  The two hops overlap.
+            nvl_bw = float(node["intra_node_bw"])
+            a_slow = reach_node * x * payload / self._tp_a
+            f_slow = total_tokens * (reach_node / self.num_f_nodes) * payload / gpn
+            t_slow = max(a_slow, f_slow) / fabric_bw + latency
+            f_nvl = total_tokens * ((reach_rank - reach_node) / self._n_f_workers) * payload
+            seconds = max(t_slow, f_nvl / nvl_bw)
+
+        lat_ms = seconds * 1000.0 * self._comm_overhead_factor
+        return PerformanceResult(lat_ms * self._scale_factor, energy=0.0, source="empirical")
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
+class AFDCombineFastAFD(Operation):
+    """A-side local reduce of the partials that actually come back.
+
+    FastAFD's combine buffer reserves one slot per top-k expert
+    (``mega_m2n.hpp`` ``combine_token_buffer``); DeepEP's elastic path
+    reserves ``min(num_ranks, num_topk)`` under ``allow_multiple_reduction``.
+    Either way the count follows top-k reach over the *expert-holding ranks* --
+    never ``f_moe_ep_size``, which in AIC defaults to 1 and silently zeroes the
+    op.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        scale_factor: float,
+        *,
+        hidden_size: int,
+        n_f_workers: int,
+        tp_a: int = 1,
+        num_experts: int = 0,
+        topk: int = 0,
+    ) -> None:
+        super().__init__(name, scale_factor)
+        self._hidden_size = int(hidden_size)
+        self._n_f_workers = max(int(n_f_workers), 1)
+        self._tp_a = max(int(tp_a), 1)
+        self._num_experts = max(int(num_experts), 0)
+        self._topk = max(int(topk), 0)
+        self._weights = 0.0
+
+    @property
+    def num_partials(self) -> float:
+        return _afd_reach(self._num_experts, self._topk, self._n_f_workers)
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        partials = self.num_partials
+        if partials <= 1.0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        x = int(kwargs.get("x", 0))
+        if x <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        tokens_per_a_rank = (x + self._tp_a - 1) // self._tp_a
+        # read `partials` BF16 buffers, write one reduced BF16 result
+        total_bytes = int(
+            (partials + 1.0)
+            * tokens_per_a_rank
+            * self._hidden_size
+            * _FASTAFD_COMBINE_BYTES_PER_ELEM
+        )
         if total_bytes <= 0:
             return PerformanceResult(0.0, 0.0, source="empirical")
         result = database.query_mem_op(total_bytes)

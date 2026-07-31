@@ -879,6 +879,34 @@ class DisaggInferenceSession:
         return disagg_summary
 
 
+def _is_moe_dispatch_op(op) -> bool:
+    """True for the model-internal MoE dispatch/combine all-to-all."""
+    return "dispatch" in str(getattr(op, "_name", "")).lower()
+
+
+def _strip_moe_dispatch_from_partition(partition):
+    """Return ``partition`` with MoE dispatch ops removed, OverlapOps included.
+
+    ``build_afd_ops_partition`` drops a bare ``MoEDispatch`` via its skip list,
+    but one nested inside an ``OverlapOp`` survives because the skip marker only
+    affects that op's classification vote -- ``OverlapOp.query()`` still sums it
+    into the F-pool latency. Rebuild such OverlapOps without the dispatch legs.
+    """
+    from aiconfigurator.sdk import operations
+
+    def rewrite(op):
+        if not isinstance(op, operations.OverlapOp):
+            return None if _is_moe_dispatch_op(op) else op
+        group_a = [o for o in (rewrite(i) for i in op._group_a) if o is not None]
+        group_b = [o for o in (rewrite(i) for i in op._group_b) if o is not None]
+        if not group_a and not group_b:
+            return None
+        return operations.OverlapOp(op._name, group_a, group_b)
+
+    partition.ffn_ops = [o for o in (rewrite(op) for op in partition.ffn_ops) if o is not None]
+    return partition
+
+
 # Private helper: bundles the five comm-side ops a single AFD layer needs.
 # Kept module-private; if a second consumer appears in the future, promote
 # to a public dataclass at that point.
@@ -1039,15 +1067,75 @@ class AFDInferenceSession:
         """
         from aiconfigurator.sdk.operations import (
             AFDCombine,
+            AFDCombineFastAFD,
             AFDFAllGather,
             AFDFReduceScatter,
             AFDTransfer,
+            AFDTransferFastAFD,
         )
 
         cfg = self._afd_config
         comm_quant = self._a_model_config.comm_quant_mode
         num_experts = int(getattr(f_model, "_num_experts", 0) or 0)
         topk = int(getattr(f_model, "_topk", 0) or 0)
+
+        if cfg.comm_model == "fastafd":
+            # FastAFD runs the F pool as pure EP (MLP_TP_SIZE=1), so there is
+            # no token-dimension AllGather/ReduceScatter inside an F node at
+            # all -- the dispatch/combine all-to-all is the whole story and is
+            # already priced by AFDTransferFastAFD.  Zero the two collectives
+            # by handing them a single-GPU node, which is their documented
+            # no-op path.
+            fastafd_shared = dict(
+                hidden_size=a_model._hidden_size,
+                n_a_workers=cfg.n_a_workers,
+                n_f_workers=cfg.n_f_workers,
+                gpus_per_node=cfg.gpus_per_node,
+                num_experts=num_experts,
+                topk=topk,
+            )
+            zeroed = dict(
+                hidden_size=a_model._hidden_size,
+                n_a_workers=cfg.n_a_workers,
+                n_f_workers=1,
+                gpus_per_node=1,
+                num_experts=num_experts,
+                topk=topk,
+                comm_quant_mode=comm_quant,
+            )
+            return _AFDCommOps(
+                a2f=AFDTransferFastAFD(
+                    name="afd_a2f_transfer",
+                    scale_factor=1.0,
+                    direction="a2f",
+                    tp_a=cfg.tp_a,
+                    comm_overhead_factor=cfg.comm_overhead_factor,
+                    **fastafd_shared,
+                ),
+                f2a=AFDTransferFastAFD(
+                    name="afd_f2a_transfer",
+                    scale_factor=1.0,
+                    direction="f2a",
+                    tp_a=cfg.tp_a,
+                    comm_overhead_factor=cfg.comm_overhead_factor,
+                    **fastafd_shared,
+                ),
+                f_ag=AFDFAllGather(
+                    name="afd_f_node_allgather", scale_factor=1.0, rank_mapping=rank_mapping, **zeroed
+                ),
+                f_rs=AFDFReduceScatter(
+                    name="afd_f_node_reducescatter", scale_factor=1.0, rank_mapping=rank_mapping, **zeroed
+                ),
+                a_combine=AFDCombineFastAFD(
+                    name="afd_a_side_combine",
+                    scale_factor=1.0,
+                    hidden_size=a_model._hidden_size,
+                    n_f_workers=cfg.n_f_workers,
+                    tp_a=cfg.tp_a,
+                    num_experts=num_experts,
+                    topk=topk,
+                ),
+            )
 
         shared = dict(
             hidden_size=a_model._hidden_size,
@@ -1440,6 +1528,14 @@ class AFDInferenceSession:
         # them to the F-Worker for sensitivity studies.
         a_partition = build_afd_ops_partition(a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         f_partition = build_afd_ops_partition(f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
+        if cfg.comm_model == "fastafd":
+            # The model-internal MoE dispatch all-to-all IS the A<->F transfer
+            # under AFD -- FastAFD's N2M/M2N path replaces it, it does not run
+            # in addition to it. The partitioner's "dispatch" marker only steers
+            # the OverlapOp classification vote, so the cost stays folded into
+            # t_f; strip it here or AFDTransferFastAFD double-bills the same
+            # bytes.
+            f_partition = _strip_moe_dispatch_from_partition(f_partition)
 
         isl = runtime_config.isl
         osl = runtime_config.osl or 1
