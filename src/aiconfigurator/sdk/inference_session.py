@@ -1593,7 +1593,10 @@ class AFDInferenceSession:
         # ``query(x=...)`` takes the number of tokens held by a single A-rank;
         # the op internally fans this out to the global token count via
         # ``n_a_workers``.
-        verification_width = max(int(getattr(a_model, "_nextn", 0)), 0) + 1
+        # ``self._nextn`` is the validated source of truth (the constructor
+        # enforces that the A and F model configs agree); the model object
+        # may not carry ``_nextn`` at all.
+        verification_width = self._nextn + 1
         tokens_per_req = effective_prefill_len if phase == "prefill" else verification_width
         afd_a_batch_tokens = a_micro_batch_size * tokens_per_req
 

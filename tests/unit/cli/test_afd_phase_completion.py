@@ -378,7 +378,11 @@ def test_afd_moe_time_replaces_generic_f_and_comm(monkeypatch):
     assert metrics["f_per_op"] == {"afd_moe_stage": pytest.approx(6.0)}
     assert metrics["t_f_layer"] == pytest.approx(3.0)
     assert metrics["t_a2f_layer"] == metrics["t_f2a_layer"] == 0.0
-    assert metrics["t_step"] == pytest.approx(10.0)
+    # This branch's ``_pipeline_global_step_latency`` reports the GLOBAL decode
+    # step (pipeline fill + t_cycle * (num_microbatches * num_layers - 1)),
+    # not main's per-microbatch ``num_layers * t_cycle``. Here that is
+    # (5 + 3) + 5 * (2*2 - 1) = 23.0 rather than 2 * 5 = 10.0.
+    assert metrics["t_step"] == pytest.approx(23.0)
 
 
 def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
@@ -450,8 +454,10 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
     )
     session = AFDInferenceSession(
         model_path="test-model",
-        a_model_config=SimpleNamespace(),
-        f_model_config=SimpleNamespace(),
+        # nextn lives on the model *config*: AFDInferenceSession validates it
+        # there and uses it as the single source of the verification width.
+        a_model_config=SimpleNamespace(nextn=2),
+        f_model_config=SimpleNamespace(nextn=2),
         database=object(),
         backend=object(),
         afd_config=cfg,
@@ -689,7 +695,10 @@ def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):
     assert result["b_total"] == expected_b_total
     assert result["concurrency"] == expected_b_total
     assert result["b_micro_total"] == session._afd_config.n_a_workers * 2
-    assert result["decode_batch_service_time_ms"] == pytest.approx(150.0)
+    # ``t_step`` already spans all microbatches on this branch, so the batch
+    # service time IS tpot; multiplying by num_microbatches (main's
+    # convention) would double-count.
+    assert result["decode_batch_service_time_ms"] == pytest.approx(50.0)
 
 
 def test_afd_summary_uses_global_batch_tpot_for_pipeline(monkeypatch):
