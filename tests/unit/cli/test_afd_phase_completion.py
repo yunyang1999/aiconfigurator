@@ -411,7 +411,118 @@ def test_afd_moe_time_replaces_generic_f_and_comm(monkeypatch):
     assert metrics["f_per_op"] == {"afd_moe_stage": pytest.approx(6.0)}
     assert metrics["t_f_layer"] == pytest.approx(3.0)
     assert metrics["t_a2f_layer"] == metrics["t_f2a_layer"] == 0.0
-    assert metrics["t_step"] == pytest.approx(10.0)
+    # This branch's ``_pipeline_global_step_latency`` reports the GLOBAL decode
+    # step (pipeline fill + t_cycle * (num_microbatches * num_layers - 1)),
+    # not main's per-microbatch ``num_layers * t_cycle``. Here that is
+    # (5 + 3) + 5 * (2*2 - 1) = 23.0 rather than 2 * 5 = 10.0.
+    assert metrics["t_step"] == pytest.approx(23.0)
+
+
+def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
+    a_op = SimpleNamespace(_name="generation_attention")
+    f_op = SimpleNamespace(_name="generation_moe")
+    partitions = [
+        SimpleNamespace(attn_ops=[a_op], ffn_ops=[]),
+        SimpleNamespace(attn_ops=[], ffn_ops=[f_op]),
+    ]
+    queried_batches = []
+    queried_transfers = []
+
+    monkeypatch.setattr(
+        "aiconfigurator.sdk.afd_partition.build_afd_ops_partition",
+        lambda *_args, **_kwargs: partitions.pop(0),
+    )
+
+    def fake_sum(self, ops, **kwargs):
+        queried_batches.append(
+            (
+                ops[0]._name,
+                kwargs["batch_size"],
+                kwargs.get("sequence_batch_size"),
+                kwargs.get("query_len"),
+            )
+        )
+        return 1.0, {ops[0]._name: 1.0}
+
+    class FakeComm:
+        def __init__(self, name):
+            self._name = name
+
+        def query(self, _database, *, x):
+            queried_transfers.append((self._name, x))
+            return 0.0
+
+    def fake_memory_summary(self, _memory, runtime_config, _free_gpu_memory_fraction):
+        summary = InferenceSummary(runtime_config)
+        summary.set_oom(False)
+        summary.set_kv_cache_oom(False)
+        return summary
+
+    monkeypatch.setattr(AFDInferenceSession, "_sum_latency", fake_sum)
+    monkeypatch.setattr(
+        AFDInferenceSession,
+        "_build_afd_comm_ops",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            a2f=FakeComm("a2f"),
+            f2a=FakeComm("f2a"),
+            f_ag=FakeComm("f_ag"),
+            f_rs=FakeComm("f_rs"),
+            a_combine=FakeComm("a_combine"),
+        ),
+    )
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_a_memory_dict", lambda *_args, **_kwargs: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_estimate_f_memory_dict", lambda *_args, **_kwargs: {"total": 1.0})
+    monkeypatch.setattr(AFDInferenceSession, "_check_memory_dict", fake_memory_summary)
+
+    cfg = AFDConfig(
+        n_a_nodes=1,
+        n_f_nodes=1,
+        gpus_per_node=4,
+        tp_a=1,
+        a_batch_size=8,
+        num_microbatches=2,
+        f_moe_ep_size=4,
+        pipeline_model="conservative",
+        combined_with_pd=False,
+    )
+    session = AFDInferenceSession(
+        model_path="test-model",
+        # nextn lives on the model *config*: AFDInferenceSession validates it
+        # there and uses it as the single source of the verification width.
+        a_model_config=SimpleNamespace(nextn=2),
+        f_model_config=SimpleNamespace(nextn=2),
+        database=object(),
+        backend=object(),
+        afd_config=cfg,
+    )
+
+    metrics = session._simulate_phase(
+        phase="decode",
+        runtime_config=RuntimeConfig(isl=99, osl=2),
+        a_model=SimpleNamespace(_num_layers=2, _nextn=2),
+        f_model=SimpleNamespace(_num_layers=2, _nextn=2),
+        free_gpu_memory_fraction=None,
+        max_seq_len=None,
+    )
+
+    # A microbatch is 8 / 2 = 4 requests. Dense A-side work sees 12 target
+    # tokens, but generation attention keeps four sequences with query_len=3
+    # so their KV prefixes are shared. The F pool receives all four A-worker
+    # microbatches, so its expanded token batch is 48.
+    assert queried_batches == [
+        ("generation_attention", 12, 4, 3),
+        ("generation_moe", 48, None, None),
+    ]
+    assert queried_transfers == [
+        ("a2f", 12),
+        ("f2a", 12),
+        ("f_ag", 12),
+        ("f_rs", 12),
+        ("a_combine", 12),
+    ]
+    assert metrics["verification_width"] == 3
+    assert metrics["a_verification_tokens_per_microbatch"] == 12
+    assert metrics["f_verification_tokens_per_microbatch"] == 48
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0, math.inf, math.nan])
@@ -617,7 +728,10 @@ def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):
     assert result["b_total"] == expected_b_total
     assert result["concurrency"] == expected_b_total
     assert result["b_micro_total"] == session._afd_config.n_a_workers * 2
-    assert result["decode_batch_service_time_ms"] == pytest.approx(150.0)
+    # ``t_step`` already spans all microbatches on this branch, so the batch
+    # service time IS tpot; multiplying by num_microbatches (main's
+    # convention) would double-count.
+    assert result["decode_batch_service_time_ms"] == pytest.approx(50.0)
 
 
 def test_afd_summary_uses_global_batch_tpot_for_pipeline(monkeypatch):
