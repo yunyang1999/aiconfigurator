@@ -659,7 +659,7 @@ def test_afd_decode_mtp_widens_compute_and_communication_queries(monkeypatch, ca
         afd_config=afd_config,
     )
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         session._simulate_phase(
             phase="decode",
             runtime_config=RuntimeConfig(isl=128, osl=2),
@@ -671,7 +671,7 @@ def test_afd_decode_mtp_widens_compute_and_communication_queries(monkeypatch, ca
 
     assert captured["x_queries"] == [3 * verify_width] * 5
     assert captured["batch_sizes"] == [3 * verify_width, 12 * verify_width]
-    assert ("verify positions share sequence KV history" in caplog.text) is (nextn > 0)
+    assert ("scaled by the q-wide verification roofline" in caplog.text) is (nextn > 0)
 
 
 def test_afd_summary_concurrency_reflects_total_in_flight_batch(monkeypatch):
