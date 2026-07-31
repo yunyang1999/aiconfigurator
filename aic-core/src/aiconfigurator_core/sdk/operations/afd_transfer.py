@@ -198,6 +198,8 @@ class AFDFAllGather(Operation):
         topk: int = 0,
         comm_quant_mode: Optional[common.CommQuantMode] = None,
         rank_mapping: str = "one_to_one",
+        full_buffer: bool = False,
+        participants: int = 0,
     ) -> None:
         super().__init__(name, scale_factor)
         if rank_mapping not in self._VALID_RANK_MAPPINGS:
@@ -212,6 +214,15 @@ class AFDFAllGather(Operation):
         self._topk = max(int(topk), 0)
         self._comm_quant_mode = comm_quant_mode or common.CommQuantMode.half
         self._rank_mapping = rank_mapping
+        # ``full_buffer`` selects the repo-wide ``query_nccl`` contract, where
+        # ``message_size`` is the FULL gathered buffer: the SOL is
+        # ``bpe * message_size * (N-1)/N / bw`` and model-side callers pass
+        # ``x * hidden`` with the undivided token count. The PR #1323 default
+        # divides by the rank count, which under-reports by that factor.
+        # ``participants`` overrides the collective width (the F-side TP group)
+        # when it is not simply the GPUs in a node.
+        self._full_buffer = bool(full_buffer)
+        self._participants = max(int(participants), 0)
         self._weights = 0.0
 
     @property
@@ -223,7 +234,9 @@ class AFDFAllGather(Operation):
 
     @property
     def f_gpus_in_node(self) -> int:
-        """Number of F-GPUs within a single node."""
+        """Collective width: the F-side TP group, capped at one node."""
+        if self._participants:
+            return max(min(self._participants, self._gpus_per_node), 1)
         return min(self._n_f_workers, self._gpus_per_node)
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
@@ -237,7 +250,9 @@ class AFDFAllGather(Operation):
         nf = self.num_f_nodes
         p_send = _afd_send_prob(self._num_experts, self._topk, nf)
         tokens_per_f_node = p_send * total
-        per_rank_elements = int(tokens_per_f_node * self._hidden_size / f_local)
+        per_rank_elements = int(
+            tokens_per_f_node * self._hidden_size / (1 if self._full_buffer else f_local)
+        )
         if per_rank_elements <= 0:
             return PerformanceResult(0.0, 0.0, source="empirical")
         result = database.query_nccl(self._comm_quant_mode, f_local, "all_gather", per_rank_elements)
@@ -281,6 +296,8 @@ class AFDFReduceScatter(Operation):
         topk: int = 0,
         comm_quant_mode: Optional[common.CommQuantMode] = None,
         rank_mapping: str = "one_to_one",
+        full_buffer: bool = False,
+        participants: int = 0,
     ) -> None:
         super().__init__(name, scale_factor)
         if rank_mapping not in self._VALID_RANK_MAPPINGS:
@@ -295,6 +312,15 @@ class AFDFReduceScatter(Operation):
         self._topk = max(int(topk), 0)
         self._comm_quant_mode = comm_quant_mode or common.CommQuantMode.half
         self._rank_mapping = rank_mapping
+        # ``full_buffer`` selects the repo-wide ``query_nccl`` contract, where
+        # ``message_size`` is the FULL gathered buffer: the SOL is
+        # ``bpe * message_size * (N-1)/N / bw`` and model-side callers pass
+        # ``x * hidden`` with the undivided token count. The PR #1323 default
+        # divides by the rank count, which under-reports by that factor.
+        # ``participants`` overrides the collective width (the F-side TP group)
+        # when it is not simply the GPUs in a node.
+        self._full_buffer = bool(full_buffer)
+        self._participants = max(int(participants), 0)
         self._weights = 0.0
 
     @property
@@ -303,7 +329,9 @@ class AFDFReduceScatter(Operation):
 
     @property
     def f_gpus_in_node(self) -> int:
-        """Number of F-GPUs within a single node."""
+        """Collective width: the F-side TP group, capped at one node."""
+        if self._participants:
+            return max(min(self._participants, self._gpus_per_node), 1)
         return min(self._n_f_workers, self._gpus_per_node)
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
@@ -317,7 +345,9 @@ class AFDFReduceScatter(Operation):
         nf = self.num_f_nodes
         p_send = _afd_send_prob(self._num_experts, self._topk, nf)
         tokens_per_f_node = p_send * total
-        per_rank_elements = int(tokens_per_f_node * self._hidden_size / f_local)
+        per_rank_elements = int(
+            tokens_per_f_node * self._hidden_size / (1 if self._full_buffer else f_local)
+        )
         if per_rank_elements <= 0:
             return PerformanceResult(0.0, 0.0, source="empirical")
         result = database.query_nccl(self._comm_quant_mode, f_local, "reduce_scatter", per_rank_elements)
@@ -413,6 +443,8 @@ class AFDTransferFastAFD(Operation):
         num_experts: int = 0,
         topk: int = 0,
         tp_a: int = 1,
+        f_moe_ep_size: int = 0,
+        f_moe_tp_size: int = 1,
         comm_overhead_factor: float = 1.0,
     ) -> None:
         super().__init__(name, scale_factor)
@@ -428,12 +460,24 @@ class AFDTransferFastAFD(Operation):
         self._num_experts = max(int(num_experts), 0)
         self._topk = max(int(topk), 0)
         self._tp_a = max(int(tp_a), 1)
+        # Expert-shard width. FastAFD runs MLP_TP=1 so every F rank owns a
+        # distinct expert slice and this equals n_f_workers, but AIC's default
+        # sweep also enumerates moe_tp > 1. Under TP a token is addressed to an
+        # EP group once and that group's AllGather fans it out, so the
+        # cross-pool leg scales with the EP width, not the rank count.
+        self._f_moe_ep_size = max(int(f_moe_ep_size), 0) or self._n_f_workers
+        self._f_moe_tp_size = max(int(f_moe_tp_size), 1)
         self._comm_overhead_factor = float(comm_overhead_factor or 1.0)
         self._weights = 0.0
 
     @property
     def direction(self) -> str:
         return self._direction
+
+    @property
+    def expert_shard_width(self) -> int:
+        """Number of independent expert partitions the A side must address."""
+        return max(min(self._f_moe_ep_size, self._n_f_workers), 1)
 
     @property
     def num_f_nodes(self) -> int:
@@ -458,8 +502,11 @@ class AFDTransferFastAFD(Operation):
         rack_gpus = node.get("num_gpus_per_rack", float("inf"))
         latency = float(node.get("p2p_latency", 0.0))
 
-        reach_rank = _afd_reach(self._num_experts, self._topk, self._n_f_workers)
-        reach_node = _afd_reach(self._num_experts, self._topk, self.num_f_nodes)
+        ep_width = self.expert_shard_width
+        reach_rank = _afd_reach(self._num_experts, self._topk, ep_width)
+        # Node-level dedup for the RDMA hop is bounded by the EP width too: a
+        # node cannot hold more distinct partitions than it has EP groups.
+        reach_node = _afd_reach(self._num_experts, self._topk, min(self.num_f_nodes, ep_width))
         payload = self._hidden_size * self.bytes_per_elem  # bytes per token per copy
         total_tokens = x * self._n_a_workers               # global tokens this microbatch
 
@@ -471,16 +518,16 @@ class AFDTransferFastAFD(Operation):
             # One NVLink/NVSwitch domain -> DeepEP's direct path: a token
             # crosses the fabric once per destination RANK.
             a_bytes = reach_rank * x * payload / self._tp_a          # per A-GPU
-            f_bytes = total_tokens * (reach_rank / self._n_f_workers) * payload  # per F-GPU
+            f_bytes = total_tokens * (reach_rank / ep_width) * payload / self._f_moe_tp_size  # per F-GPU
             seconds = max(a_bytes, f_bytes) / fabric_bw + latency
         else:
             # Hybrid path: the slow link carries one copy per destination NODE,
             # then NVLink fans out inside that node.  The two hops overlap.
             nvl_bw = float(node["intra_node_bw"])
             a_slow = reach_node * x * payload / self._tp_a
-            f_slow = total_tokens * (reach_node / self.num_f_nodes) * payload / gpn
+            f_slow = total_tokens * (reach_node / max(min(self.num_f_nodes, ep_width), 1)) * payload / gpn
             t_slow = max(a_slow, f_slow) / fabric_bw + latency
-            f_nvl = total_tokens * ((reach_rank - reach_node) / self._n_f_workers) * payload
+            f_nvl = total_tokens * ((reach_rank - reach_node) / ep_width) * payload
             seconds = max(t_slow, f_nvl / nvl_bw)
 
         lat_ms = seconds * 1000.0 * self._comm_overhead_factor
@@ -511,6 +558,7 @@ class AFDCombineFastAFD(Operation):
         tp_a: int = 1,
         num_experts: int = 0,
         topk: int = 0,
+        f_moe_ep_size: int = 0,
     ) -> None:
         super().__init__(name, scale_factor)
         self._hidden_size = int(hidden_size)
@@ -518,11 +566,14 @@ class AFDCombineFastAFD(Operation):
         self._tp_a = max(int(tp_a), 1)
         self._num_experts = max(int(num_experts), 0)
         self._topk = max(int(topk), 0)
+        self._f_moe_ep_size = max(int(f_moe_ep_size), 0) or self._n_f_workers
         self._weights = 0.0
 
     @property
     def num_partials(self) -> float:
-        return _afd_reach(self._num_experts, self._topk, self._n_f_workers)
+        """One partial per expert partition that holds >=1 of the token's top-k."""
+        return _afd_reach(self._num_experts, self._topk,
+                          max(min(self._f_moe_ep_size, self._n_f_workers), 1))
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         partials = self.num_partials
