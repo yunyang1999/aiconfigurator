@@ -33,7 +33,9 @@ EXEMPT: dict[str, str] = {
     # engine-step path is never involved). Retirement prerequisite: the thin
     # op-list evaluation FFI (see the Python-path freeze tracking issue).
     "AFDTransfer": "AFD orchestration is Python-side; op-list FFI planned",
+    "AFDTransferFastAFD": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDCombine": "AFD orchestration is Python-side; op-list FFI planned",
+    "AFDCombineFastAFD": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFAllGather": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFReduceScatter": "AFD orchestration is Python-side; op-list FFI planned",
     # Dead class: no model instantiates it (Mamba2Kernel is the live op and

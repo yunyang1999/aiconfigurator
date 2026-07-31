@@ -251,6 +251,11 @@ def _is_boundary_op(name: str) -> bool:
             "logits_gemm",
             "reduce_add",
             "add_norm_2",
+            # DeepSeek-V4 manifold-constrained hyper-connection. ``mhc_post``
+            # sits after attention and before the FFN norm -- structurally the
+            # same slot as ``add_norm_2`` -- so it is a boundary op and follows
+            # ``boundary_on_attn`` rather than being pinned to one pool.
+            "mhc_post",
             "_ffn_norm",
             "_moe_norm",
             "_mlp_norm",
@@ -276,6 +281,9 @@ def _is_attention_side_op(name: str) -> bool:
         for marker in (
             "embedding",
             "add_norm_1",
+            # ``mhc_pre`` runs before the attention norm, i.e. the same slot as
+            # ``add_norm_1``; the whole attention sub-block lives on the A pool.
+            "mhc_pre",
             "_attn_norm",
             "attention",
             "qkv",
