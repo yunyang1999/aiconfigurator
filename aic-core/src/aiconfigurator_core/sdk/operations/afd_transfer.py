@@ -200,6 +200,7 @@ class AFDFAllGather(Operation):
         rank_mapping: str = "one_to_one",
         full_buffer: bool = False,
         participants: int = 0,
+        f_moe_tp_size: int = 0,
     ) -> None:
         super().__init__(name, scale_factor)
         if rank_mapping not in self._VALID_RANK_MAPPINGS:
@@ -223,7 +224,19 @@ class AFDFAllGather(Operation):
         # when it is not simply the GPUs in a node.
         self._full_buffer = bool(full_buffer)
         self._participants = max(int(participants), 0)
+        # Existence gate only -- it does not touch sizing. A token-dimension
+        # collective presupposes a TP group on the F side; under pure EP
+        # (moe_tp == 1) every F rank owns its own experts and there is nothing
+        # to gather along tokens. The historical gate was
+        # ``min(n_f_workers, gpus_per_node) > 1``, a property of the fabric,
+        # which fires whether or not such a group exists. 0 means "caller did
+        # not say", which preserves the historical behaviour exactly.
+        self._f_moe_tp_size = max(int(f_moe_tp_size), 0)
         self._weights = 0.0
+
+    @property
+    def has_tp_group(self) -> bool:
+        return self._f_moe_tp_size != 1
 
     @property
     def num_f_nodes(self) -> int:
@@ -241,7 +254,7 @@ class AFDFAllGather(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         f_local = self.f_gpus_in_node
-        if f_local <= 1 or self._rank_mapping != "one_to_one":
+        if f_local <= 1 or self._rank_mapping != "one_to_one" or not self.has_tp_group:
             return PerformanceResult(0.0, 0.0, source="empirical")
         x = int(kwargs.get("x", 0))
         if x <= 0:
@@ -298,6 +311,7 @@ class AFDFReduceScatter(Operation):
         rank_mapping: str = "one_to_one",
         full_buffer: bool = False,
         participants: int = 0,
+        f_moe_tp_size: int = 0,
     ) -> None:
         super().__init__(name, scale_factor)
         if rank_mapping not in self._VALID_RANK_MAPPINGS:
@@ -321,7 +335,19 @@ class AFDFReduceScatter(Operation):
         # when it is not simply the GPUs in a node.
         self._full_buffer = bool(full_buffer)
         self._participants = max(int(participants), 0)
+        # Existence gate only -- it does not touch sizing. A token-dimension
+        # collective presupposes a TP group on the F side; under pure EP
+        # (moe_tp == 1) every F rank owns its own experts and there is nothing
+        # to gather along tokens. The historical gate was
+        # ``min(n_f_workers, gpus_per_node) > 1``, a property of the fabric,
+        # which fires whether or not such a group exists. 0 means "caller did
+        # not say", which preserves the historical behaviour exactly.
+        self._f_moe_tp_size = max(int(f_moe_tp_size), 0)
         self._weights = 0.0
+
+    @property
+    def has_tp_group(self) -> bool:
+        return self._f_moe_tp_size != 1
 
     @property
     def num_f_nodes(self) -> int:
@@ -336,7 +362,7 @@ class AFDFReduceScatter(Operation):
 
     def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
         f_local = self.f_gpus_in_node
-        if f_local <= 1 or self._rank_mapping != "one_to_one":
+        if f_local <= 1 or self._rank_mapping != "one_to_one" or not self.has_tp_group:
             return PerformanceResult(0.0, 0.0, source="empirical")
         x = int(kwargs.get("x", 0))
         if x <= 0:
