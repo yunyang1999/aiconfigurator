@@ -36,6 +36,9 @@ EXEMPT: dict[str, str] = {
     "AFDTransferFastAFD": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDCombine": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDCombineFastAFD": "AFD orchestration is Python-side; op-list FFI planned",
+    "AFDCombinePR1323New": "AFD orchestration is Python-side; op-list FFI planned",
+    "AFDGroupCollectivePR1323New": "AFD orchestration is Python-side; op-list FFI planned",
+    "AFDTransferPR1323New": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFAllGather": "AFD orchestration is Python-side; op-list FFI planned",
     "AFDFReduceScatter": "AFD orchestration is Python-side; op-list FFI planned",
     # Dead class: no model instantiates it (Mamba2Kernel is the live op and

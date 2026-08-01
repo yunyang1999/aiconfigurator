@@ -904,7 +904,12 @@ def _strip_moe_dispatch_from_partition(partition):
             return None
         return operations.OverlapOp(op._name, group_a, group_b)
 
+    stripped = [op for op in partition.ffn_ops if _is_moe_dispatch_op(op)]
     partition.ffn_ops = [o for o in (rewrite(op) for op in partition.ffn_ops) if o is not None]
+    # Make the removal visible. A dispatch nested in an OverlapOp never reached
+    # ``skipped_ops`` before, so the audit trail said nothing was dropped --
+    # which is why this cost went unnoticed inside t_f for so long.
+    partition.skipped_ops = list(partition.skipped_ops) + stripped
     return partition
 
 
@@ -1106,6 +1111,41 @@ class AFDInferenceSession:
         comm_quant = self._a_model_config.comm_quant_mode
         num_experts = int(getattr(f_model, "_num_experts", 0) or 0)
         topk = int(getattr(f_model, "_topk", 0) or 0)
+
+        if cfg.comm_model == "pr1323new":
+            from aiconfigurator.sdk.operations import (
+                AFDCombinePR1323New,
+                AFDGroupCollectivePR1323New,
+                AFDTransferPR1323New,
+            )
+
+            shared_new = dict(
+                hidden_size=a_model._hidden_size,
+                n_a_workers=cfg.n_a_workers,
+                n_f_workers=cfg.n_f_workers,
+                gpus_per_node=cfg.gpus_per_node,
+                num_experts=num_experts,
+                topk=topk,
+                tp_a=cfg.tp_a,
+                f_moe_ep_size=cfg.f_moe_ep_size,
+                comm_quant_mode=comm_quant,
+            )
+            return _AFDCommOps(
+                a2f=AFDTransferPR1323New(name="afd_a2f_transfer", scale_factor=1.0,
+                                         direction="a2f",
+                                         comm_overhead_factor=cfg.comm_overhead_factor,
+                                         **shared_new),
+                f2a=AFDTransferPR1323New(name="afd_f2a_transfer", scale_factor=1.0,
+                                         direction="f2a",
+                                         comm_overhead_factor=cfg.comm_overhead_factor,
+                                         **shared_new),
+                f_ag=AFDGroupCollectivePR1323New(name="afd_f_group_allgather", scale_factor=1.0,
+                                                 collective="all_gather", **shared_new),
+                f_rs=AFDGroupCollectivePR1323New(name="afd_f_group_reducescatter", scale_factor=1.0,
+                                                 collective="reduce_scatter", **shared_new),
+                a_combine=AFDCombinePR1323New(name="afd_a_side_combine", scale_factor=1.0,
+                                              **shared_new),
+            )
 
         if cfg.comm_model == "fastafd":
             # The F pool's layout decides the shape of the comm. FastAFD runs
@@ -1582,7 +1622,7 @@ class AFDInferenceSession:
         a_partition = build_afd_ops_partition(a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         f_partition = build_afd_ops_partition(f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         afd_moe_time_ms = self._afd_moe_time_ms if phase == "decode" else None
-        if cfg.comm_model == "fastafd" and afd_moe_time_ms is None:
+        if cfg.comm_model in ("fastafd", "pr1323new") and afd_moe_time_ms is None:
             # The model-internal MoE dispatch all-to-all IS the A<->F transfer
             # under AFD -- FastAFD's N2M/M2N path replaces it, it does not run
             # in addition to it. The partitioner's "dispatch" marker only steers
