@@ -1219,6 +1219,14 @@ class AFDInferenceSession:
                 ),
             )
 
+        # pr1323todo: identical to pr1323 except the F-side collective is told
+        # the TP width, so it can tell "no TP group" from "more than one GPU in
+        # a node". Sizing, participants and the cross-pool transfer are left
+        # exactly as merged.
+        collective_gate = {}
+        if cfg.comm_model == "pr1323todo":
+            collective_gate = dict(f_moe_tp_size=max(cfg.n_f_workers // max(int(cfg.f_moe_ep_size), 1), 1))
+
         shared = dict(
             hidden_size=a_model._hidden_size,
             n_a_workers=cfg.n_a_workers,
@@ -1247,12 +1255,14 @@ class AFDInferenceSession:
                 name="afd_f_node_allgather",
                 scale_factor=1.0,
                 rank_mapping=rank_mapping,
+                **collective_gate,
                 **shared,
             ),
             f_rs=AFDFReduceScatter(
                 name="afd_f_node_reducescatter",
                 scale_factor=1.0,
                 rank_mapping=rank_mapping,
+                **collective_gate,
                 **shared,
             ),
             a_combine=AFDCombine(

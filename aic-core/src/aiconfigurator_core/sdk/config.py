@@ -263,6 +263,11 @@ class AFDConfig:
     # Which cross-pool communication model to price the A<->F boundary with.
     #   "pr1323"  -- the model as merged in PR #1323 (symmetric legs, one
     #                destination billed, expert shard = node, F-node AG/RS)
+    #   "pr1323todo" -- pr1323 with exactly one change: the F-side
+    #                 AllGather/ReduceScatter no longer fires when the F pool
+    #                 has no TP group (pure EP). Everything else, including the
+    #                 collective's sizing and the cross-pool transfer, is
+    #                 untouched, so the pair isolates that one effect.
     #   "pr1323new" -- pr1323 with the eleven audited communication defects
     #                fixed and nothing else changed, so the two stay directly
     #                comparable. See operations/afd_transfer.py.
@@ -283,7 +288,7 @@ class AFDConfig:
             raise ValueError(f"phase must be one of {valid_phases}, got {self.phase!r}.")
         if self.pipeline_model not in valid_pipeline_models:
             raise ValueError(f"pipeline_model must be one of {valid_pipeline_models}, got {self.pipeline_model!r}.")
-        valid_comm_models = ("pr1323", "pr1323new", "fastafd")
+        valid_comm_models = ("pr1323", "pr1323todo", "pr1323new", "fastafd")
         if self.comm_model not in valid_comm_models:
             raise ValueError(f"comm_model must be one of {valid_comm_models}, got {self.comm_model!r}.")
         if self.n_a_nodes < 1 or self.n_f_nodes < 1:
