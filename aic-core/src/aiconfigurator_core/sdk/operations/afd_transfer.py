@@ -601,3 +601,222 @@ class AFDCombineFastAFD(Operation):
 
     def get_weights(self, **kwargs):
         return self._weights
+
+
+# --------------------------------------------------------------------------- #
+# "pr1323new": PR #1323's model with the eleven audited defects fixed
+#
+# Scope is deliberately narrow -- it corrects what was measurably wrong and
+# changes nothing else. In particular it keeps ``comm_quant_mode`` symmetric
+# for both legs (the FP8-out/BF16-back asymmetry real stacks show is a separate
+# question) and charges no buffer memory, so it stays comparable to ``pr1323``
+# term by term.
+#
+#  1 sum over destinations instead of billing one
+#  2 model incast -- an F rank receives from every A worker
+#  3 shard experts over EP groups, not over physical nodes
+#  4 drop the F-side collective when the F pool has no TP group
+#  5 size that collective with the full-buffer query_nccl contract
+#  6 let its participant count be the real TP width, uncapped
+#  7 stop billing the model-internal MoE dispatch as F-pool compute
+#  8 pick the fabric tier from the GPU count instead of always inter_node_bw
+#  9 a dense token reaches one F replica, it is not split across nodes
+# 10 count arriving partials, not the EP width
+# 11 one definition of ``x`` shared by every op (tokens per A worker)
+# --------------------------------------------------------------------------- #
+
+
+class _AFDTopology:
+    """Single source of truth for AFD deployment shape.
+
+    Every op derives from this, so they cannot disagree about whether a count
+    is GPUs or workers -- the conflation behind defects 2, 3 and 11.
+    """
+
+    def __init__(self, *, n_a_workers, n_f_workers, gpus_per_node, tp_a,
+                 f_moe_ep_size, num_experts, topk):
+        self.n_a_workers = max(int(n_a_workers), 1)      # DP replicas
+        self.tp_a = max(int(tp_a), 1)                    # GPUs per A replica
+        self.a_gpus = self.n_a_workers * self.tp_a
+        self.f_gpus = max(int(n_f_workers), 1)           # GPUs
+        self.gpus_per_node = max(int(gpus_per_node), 1)
+        self.num_experts = max(int(num_experts), 0)
+        self.topk = max(int(topk), 0)
+        # Defect 3/9: the destination unit is the expert partition. A dense
+        # model has one partition -- under the Phase-1 F-DP=1 invariant the F
+        # pool is a single replica, so a dense token goes to one place and is
+        # then spread by the F-side collective, not split across nodes.
+        ep = max(int(f_moe_ep_size), 1) if self.num_experts > 0 else 1
+        self.ep_width = max(min(ep, self.f_gpus), 1)
+        self.moe_tp = max(self.f_gpus // self.ep_width, 1)
+
+    @property
+    def total_gpus(self) -> int:
+        return self.a_gpus + self.f_gpus
+
+    @property
+    def reach(self) -> float:
+        """Expected number of expert partitions one token must be sent to."""
+        return _afd_reach(self.num_experts, self.topk, self.ep_width)
+
+    def bandwidth(self, database: PerfDatabase) -> float:
+        """Defect 8: choose the tier the traffic actually crosses.
+
+        ``query_p2p`` hardcodes ``inter_node_bw`` (it carries a standing TODO
+        saying so). ``SystemSpec.get_p2p_bandwidth`` already implements the
+        node / rack / inter-rack ladder; feed it the deployment's GPU count.
+        """
+        return float(database.system_spec.get_p2p_bandwidth(self.total_gpus))
+
+
+class AFDTransferPR1323New(Operation):
+    """Cross-pool transfer, summed over destinations and incast-aware."""
+
+    _VALID_DIRECTIONS = ("a2f", "f2a")
+
+    def __init__(self, name: str, scale_factor: float, *, direction: str,
+                 hidden_size: int, n_a_workers: int, n_f_workers: int,
+                 gpus_per_node: int = 8, num_experts: int = 0, topk: int = 0,
+                 tp_a: int = 1, f_moe_ep_size: int = 0,
+                 comm_quant_mode: Optional[common.CommQuantMode] = None,
+                 comm_overhead_factor: float = 1.0) -> None:
+        super().__init__(name, scale_factor)
+        if direction not in self._VALID_DIRECTIONS:
+            raise ValueError(
+                f"AFDTransferPR1323New: direction must be one of {self._VALID_DIRECTIONS}, got {direction!r}"
+            )
+        self._direction = direction
+        self._hidden_size = int(hidden_size)
+        self._topo = _AFDTopology(n_a_workers=n_a_workers, n_f_workers=n_f_workers,
+                                  gpus_per_node=gpus_per_node, tp_a=tp_a,
+                                  f_moe_ep_size=f_moe_ep_size, num_experts=num_experts,
+                                  topk=topk)
+        self._comm_quant_mode = comm_quant_mode or common.CommQuantMode.half
+        self._comm_overhead_factor = float(comm_overhead_factor or 1.0)
+        self._weights = 0.0
+
+    @property
+    def direction(self) -> str:
+        return self._direction
+
+    @property
+    def topology(self) -> _AFDTopology:
+        return self._topo
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        x = int(kwargs.get("x", 0))                       # defect 11: tokens per A worker
+        if x <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        t = self._topo
+        payload = self._hidden_size * self._comm_quant_mode.value.memory
+        reach = t.reach
+
+        # Defect 1: every destination's copy leaves the same port.
+        a_egress = reach * x * payload / t.tp_a
+        # Defect 2: an F rank is fed by all A workers. Tokens landing on one
+        # partition = total x reach/ep_width; the partition's TP ranks share it.
+        f_ingress = (x * t.n_a_workers) * (reach / t.ep_width) * payload / t.moe_tp
+
+        bw = t.bandwidth(database)
+        latency = float(database.system_spec["node"].get("p2p_latency", 0.0))
+        seconds = max(a_egress, f_ingress) / bw + latency
+        lat_ms = seconds * 1000.0 * self._comm_overhead_factor
+        return PerformanceResult(lat_ms * self._scale_factor, energy=0.0, source="empirical")
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
+class AFDGroupCollectivePR1323New(Operation):
+    """F-side token-dimension collective, present only when a TP group exists."""
+
+    _VALID = ("all_gather", "reduce_scatter")
+
+    def __init__(self, name: str, scale_factor: float, *, collective: str,
+                 hidden_size: int, n_a_workers: int, n_f_workers: int,
+                 gpus_per_node: int = 8, num_experts: int = 0, topk: int = 0,
+                 tp_a: int = 1, f_moe_ep_size: int = 0,
+                 comm_quant_mode: Optional[common.CommQuantMode] = None) -> None:
+        super().__init__(name, scale_factor)
+        if collective not in self._VALID:
+            raise ValueError(f"AFDGroupCollectivePR1323New: collective must be one of {self._VALID}")
+        self._collective = collective
+        self._hidden_size = int(hidden_size)
+        self._topo = _AFDTopology(n_a_workers=n_a_workers, n_f_workers=n_f_workers,
+                                  gpus_per_node=gpus_per_node, tp_a=tp_a,
+                                  f_moe_ep_size=f_moe_ep_size, num_experts=num_experts,
+                                  topk=topk)
+        self._comm_quant_mode = comm_quant_mode or common.CommQuantMode.half
+        self._weights = 0.0
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        t = self._topo
+        # Defect 4: pure EP has no TP group, so no token-dimension collective.
+        # The old gate was min(n_f_workers, gpus_per_node) > 1 -- a property of
+        # the fabric, which fires whether or not a TP group exists.
+        if t.moe_tp <= 1:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        x = int(kwargs.get("x", 0))
+        if x <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        tokens_in_group = (x * t.n_a_workers) * (t.reach / t.ep_width)
+        # Defect 5: repo-wide contract -- message_size is the FULL buffer.
+        # Defect 6: the width is the TP group, not the GPUs in a node; passing
+        # the true count also makes query_nccl select the right bandwidth tier.
+        elements = int(tokens_in_group * self._hidden_size)
+        if elements <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        result = database.query_nccl(self._comm_quant_mode, t.moe_tp, self._collective, elements)
+        return PerformanceResult(float(result) * self._scale_factor,
+                                 energy=result.energy * self._scale_factor,
+                                 source=getattr(result, "source", "silicon"))
+
+    def get_weights(self, **kwargs):
+        return self._weights
+
+
+class AFDCombinePR1323New(Operation):
+    """A-side reduce over the partials that actually arrive."""
+
+    def __init__(self, name: str, scale_factor: float, *, hidden_size: int,
+                 n_a_workers: int, n_f_workers: int, gpus_per_node: int = 8,
+                 num_experts: int = 0, topk: int = 0, tp_a: int = 1,
+                 f_moe_ep_size: int = 0,
+                 comm_quant_mode: Optional[common.CommQuantMode] = None) -> None:
+        super().__init__(name, scale_factor)
+        self._hidden_size = int(hidden_size)
+        self._topo = _AFDTopology(n_a_workers=n_a_workers, n_f_workers=n_f_workers,
+                                  gpus_per_node=gpus_per_node, tp_a=tp_a,
+                                  f_moe_ep_size=f_moe_ep_size, num_experts=num_experts,
+                                  topk=topk)
+        self._comm_quant_mode = comm_quant_mode or common.CommQuantMode.half
+        self._weights = 0.0
+
+    @property
+    def num_partials(self) -> float:
+        # Defect 10: one partial per partition holding >=1 of the token's
+        # top-k, i.e. the same reach the transfer uses -- capped by topk, not
+        # equal to the EP width (which also made ep=1 return exactly zero).
+        return self._topo.reach
+
+    def query(self, database: PerfDatabase, **kwargs) -> PerformanceResult:
+        partials = self.num_partials
+        if partials <= 1.0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        x = int(kwargs.get("x", 0))
+        if x <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        # Defect 11: x is tokens per A worker in every op; the A worker's GPUs
+        # split the reduce.
+        tokens_per_a_gpu = (x + self._topo.tp_a - 1) // self._topo.tp_a
+        bpe = self._comm_quant_mode.value.memory
+        total_bytes = int((partials + 1.0) * tokens_per_a_gpu * self._hidden_size * bpe)
+        if total_bytes <= 0:
+            return PerformanceResult(0.0, 0.0, source="empirical")
+        result = database.query_mem_op(total_bytes)
+        return PerformanceResult(float(result) * self._scale_factor,
+                                 energy=result.energy * self._scale_factor,
+                                 source=getattr(result, "source", "silicon"))
+
+    def get_weights(self, **kwargs):
+        return self._weights
