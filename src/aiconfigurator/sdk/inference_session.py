@@ -1100,124 +1100,15 @@ class AFDInferenceSession:
         """
         from aiconfigurator.sdk.operations import (
             AFDCombine,
-            AFDCombineFastAFD,
             AFDFAllGather,
             AFDFReduceScatter,
             AFDTransfer,
-            AFDTransferFastAFD,
         )
 
         cfg = self._afd_config
         comm_quant = self._a_model_config.comm_quant_mode
         num_experts = int(getattr(f_model, "_num_experts", 0) or 0)
         topk = int(getattr(f_model, "_topk", 0) or 0)
-
-        if cfg.comm_model == "pr1323new":
-            from aiconfigurator.sdk.operations import (
-                AFDCombinePR1323New,
-                AFDGroupCollectivePR1323New,
-                AFDTransferPR1323New,
-            )
-
-            shared_new = dict(
-                hidden_size=a_model._hidden_size,
-                n_a_workers=cfg.n_a_workers,
-                n_f_workers=cfg.n_f_workers,
-                gpus_per_node=cfg.gpus_per_node,
-                num_experts=num_experts,
-                topk=topk,
-                tp_a=cfg.tp_a,
-                f_moe_ep_size=cfg.f_moe_ep_size,
-                comm_quant_mode=comm_quant,
-            )
-            return _AFDCommOps(
-                a2f=AFDTransferPR1323New(name="afd_a2f_transfer", scale_factor=1.0,
-                                         direction="a2f",
-                                         comm_overhead_factor=cfg.comm_overhead_factor,
-                                         **shared_new),
-                f2a=AFDTransferPR1323New(name="afd_f2a_transfer", scale_factor=1.0,
-                                         direction="f2a",
-                                         comm_overhead_factor=cfg.comm_overhead_factor,
-                                         **shared_new),
-                f_ag=AFDGroupCollectivePR1323New(name="afd_f_group_allgather", scale_factor=1.0,
-                                                 collective="all_gather", **shared_new),
-                f_rs=AFDGroupCollectivePR1323New(name="afd_f_group_reducescatter", scale_factor=1.0,
-                                                 collective="reduce_scatter", **shared_new),
-                a_combine=AFDCombinePR1323New(name="afd_a_side_combine", scale_factor=1.0,
-                                              **shared_new),
-            )
-
-        if cfg.comm_model == "fastafd":
-            # The F pool's layout decides the shape of the comm. FastAFD runs
-            # MLP_TP_SIZE=1 (pure EP), where the dispatch/combine all-to-all is
-            # the whole story and there is no token-dimension collective inside
-            # an F node. AIC's default sweep also enumerates moe_tp > 1
-            # (f_moe_ep_size in [1, 2, n_f_nodes, tp_f]); there a token is
-            # addressed to an EP group once and that group's AllGather fans it
-            # out, so both legs must be priced. Deriving the widths here rather
-            # than assuming pure EP keeps the sweep from favouring the low-EP
-            # candidates simply because they were under-priced.
-            f_moe_ep = max(int(cfg.f_moe_ep_size), 1)
-            f_moe_tp = max(cfg.n_f_workers // f_moe_ep, 1)
-            fastafd_shared = dict(
-                hidden_size=a_model._hidden_size,
-                n_a_workers=cfg.n_a_workers,
-                n_f_workers=cfg.n_f_workers,
-                gpus_per_node=cfg.gpus_per_node,
-                num_experts=num_experts,
-                topk=topk,
-            )
-            # Present only when the F side actually shards the MoE by TP; sized
-            # with the repo-wide full-buffer NCCL contract.
-            collective = dict(
-                hidden_size=a_model._hidden_size,
-                n_a_workers=cfg.n_a_workers,
-                n_f_workers=cfg.n_f_workers if f_moe_tp > 1 else 1,
-                gpus_per_node=cfg.gpus_per_node if f_moe_tp > 1 else 1,
-                num_experts=num_experts,
-                topk=topk,
-                comm_quant_mode=comm_quant,
-                full_buffer=True,
-                participants=f_moe_tp,
-            )
-            return _AFDCommOps(
-                a2f=AFDTransferFastAFD(
-                    name="afd_a2f_transfer",
-                    scale_factor=1.0,
-                    direction="a2f",
-                    tp_a=cfg.tp_a,
-                    f_moe_ep_size=f_moe_ep,
-                    f_moe_tp_size=f_moe_tp,
-                    comm_overhead_factor=cfg.comm_overhead_factor,
-                    **fastafd_shared,
-                ),
-                f2a=AFDTransferFastAFD(
-                    name="afd_f2a_transfer",
-                    scale_factor=1.0,
-                    direction="f2a",
-                    tp_a=cfg.tp_a,
-                    f_moe_ep_size=f_moe_ep,
-                    f_moe_tp_size=f_moe_tp,
-                    comm_overhead_factor=cfg.comm_overhead_factor,
-                    **fastafd_shared,
-                ),
-                f_ag=AFDFAllGather(
-                    name="afd_f_node_allgather", scale_factor=1.0, rank_mapping=rank_mapping, **collective
-                ),
-                f_rs=AFDFReduceScatter(
-                    name="afd_f_node_reducescatter", scale_factor=1.0, rank_mapping=rank_mapping, **collective
-                ),
-                a_combine=AFDCombineFastAFD(
-                    name="afd_a_side_combine",
-                    scale_factor=1.0,
-                    hidden_size=a_model._hidden_size,
-                    n_f_workers=cfg.n_f_workers,
-                    tp_a=cfg.tp_a,
-                    num_experts=num_experts,
-                    topk=topk,
-                    f_moe_ep_size=f_moe_ep,
-                ),
-            )
 
         # pr1323todo: identical to pr1323 except that the model-internal MoE
         # dispatch is no longer billed as F-pool compute -- the ``dispatch``
@@ -1628,14 +1519,13 @@ class AFDInferenceSession:
         a_partition = build_afd_ops_partition(a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         f_partition = build_afd_ops_partition(f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         afd_moe_time_ms = self._afd_moe_time_ms if phase == "decode" else None
-        if cfg.comm_model in ("fastafd", "pr1323new", "pr1323todo") and afd_moe_time_ms is None:
+        if cfg.comm_model == "pr1323todo" and afd_moe_time_ms is None:
             # The model-internal MoE dispatch all-to-all IS the A<->F transfer
-            # under AFD -- FastAFD's N2M/M2N path replaces it, it does not run
-            # in addition to it. The partitioner's "dispatch" marker only steers
-            # the OverlapOp classification vote, so the cost stays folded into
-            # t_f; strip it here or AFDTransferFastAFD double-bills the same
-            # bytes. Under a measured override the whole F stage is replaced,
-            # so there is nothing left to strip.
+            # under AFD; it does not run in addition to it. The partitioner's
+            # "dispatch" marker only steers the OverlapOp classification vote,
+            # so the cost stays folded into t_f and the same bytes get billed
+            # twice. Strip it here. Under a measured override the whole F stage
+            # is replaced, so there is nothing left to strip.
             f_partition = _strip_moe_dispatch_from_partition(f_partition)
         if afd_moe_time_ms is not None:
             router_ops = [op for op in a_partition.ffn_ops if "router" in op._name.lower()]

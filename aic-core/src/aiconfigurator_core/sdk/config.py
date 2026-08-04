@@ -271,10 +271,6 @@ class AFDConfig:
     #   "pr1323new" -- pr1323 with the eleven audited communication defects
     #                fixed and nothing else changed, so the two stay directly
     #                comparable. See operations/afd_transfer.py.
-    #   "fastafd" -- calibrated against hao-ai-lab/FastAFD: sums over
-    #                destinations, expert shard = rank, FP8 out / BF16 back,
-    #                incast-aware, and no F-side token AllGather/ReduceScatter
-    #                because the F pool runs pure EP.
     comm_model: str = "pr1323"
 
     # -- Derived (set in __post_init__) --
