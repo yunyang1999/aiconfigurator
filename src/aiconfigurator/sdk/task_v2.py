@@ -603,7 +603,7 @@ class Task:
     afd_boundary_on_attn: bool = True
     # Which cross-pool communication model to price the A<->F boundary with.
     # "pr1323" keeps the model as merged; "fastafd" is the layout-aware one
-    # calibrated against hao-ai-lab/FastAFD. See AFDConfig.comm_model.
+    # See AFDConfig.comm_model.
     afd_comm_model: str = "pr1323"
     afd_total_batch_size: int | None = None
     # Per-A-worker ceiling for the automatic A-batch search.
