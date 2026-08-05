@@ -1131,7 +1131,7 @@ mod tests {
         let ctx_cases: &[(u32, u32, f64)] = &[
             (4, 4096, 2.4523092905680337),   // exact hit
             (4, 5000, 3.551457374840901),    // seq interior (sqrt blend)
-            (4, 100000, 1456.7266741020528), // beyond seq range (util-hold)
+            (4, 100000, 1320.0793609388054), // beyond seq range (kNN util-hold)
         ];
         for &(b, s, expected) in ctx_cases {
             let got = table
@@ -1144,7 +1144,7 @@ mod tests {
         let gen_cases: &[(u32, u32, f64)] = &[
             (1, 4096, 0.02057066683967908),   // exact hit
             (1, 3000, 0.018758271161156394),  // seq interior (raw blend)
-            (1, 500000, 0.22062800915836348), // beyond seq range (util-hold)
+            (1, 500000, 0.18566833478430603), // beyond seq range (kNN util-hold)
         ];
         for &(b, s, expected) in gen_cases {
             let got = table
@@ -1173,9 +1173,9 @@ mod tests {
 
         // db.query_context_mla_module(b, s, prefix=0, num_heads=128, bf16^3)
         let ctx_mod_cases: &[(u32, u32, f64)] = &[
-            (2, 4096, 2.6503),              // exact hit
-            (2, 5000, 3.532393382077576),   // seq interior (sqrt blend)
-            (2, 100000, 702.2051140666009), // beyond seq range (util-hold)
+            (2, 4096, 2.6503),             // exact hit
+            (2, 5000, 3.532393382077576),  // seq interior (sqrt blend)
+            (2, 100000, 709.522434052603), // beyond seq range (kNN util-hold)
         ];
         for &(b, s, expected) in ctx_mod_cases {
             let got = table
@@ -1195,7 +1195,7 @@ mod tests {
         let gen_mod_cases: &[(u32, u32, f64)] = &[
             (8, 4097, 0.0938),               // exact hit
             (8, 3000, 0.0918716796875),      // seq interior (raw blend)
-            (8, 500000, 1.0565041038424121), // beyond seq range (util-hold)
+            (8, 500000, 1.0854377731191145), // beyond seq range (kNN util-hold)
         ];
         for &(b, s, expected) in gen_mod_cases {
             let got = table

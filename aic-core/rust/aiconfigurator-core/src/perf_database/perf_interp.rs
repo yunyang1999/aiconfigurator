@@ -14,9 +14,14 @@
 //!                             the dropped axis). ScatteredSites: site curve
 //!                             eval; unknown site -> nearest-site transfer in
 //!                             util space (log2 IDW, curve-coverage filter,
-//!                             distance gate).
-//! 3. beyond the range      -> hold the boundary util (k_tail-median anchor),
-//!                             latency = SOL(query) / util
+//!                             distance gate; the gate is waived for a site
+//!                             beyond the scale-up frontier).
+//! 3. beyond the range      -> hold a boundary util, latency = SOL(query)/util.
+//!                             Multi-axis grids transfer the util from the
+//!                             `nn_leaves` nearest collected points in joint
+//!                             log2 space (inverse-distance blend, continuous
+//!                             — no nearest-path snap); 1-D curves anchor on
+//!                             the k_tail-median boundary points.
 //! 4. nothing to anchor on  -> Err (structured miss; never fabricate)
 //!
 //! Differences from the Python engine, all deliberate:
@@ -55,6 +60,25 @@ impl Node {
                     map.entry(path[0])
                         .or_insert_with(Node::branch)
                         .insert(&path[1..], value);
+                }
+            }
+            Node::Leaf(_) => panic!("insert into a leaf"),
+        }
+    }
+
+    /// First-wins leaf insert: keeps an existing leaf untouched. Loaders use
+    /// this when merging priority-ordered shared-layer sources (the first
+    /// source that has a coordinate wins; `insert` would let later, lower-
+    /// priority sources overwrite it).
+    pub fn insert_first_wins(&mut self, path: &[u32], value: f64) {
+        match self {
+            Node::Branch(map) => {
+                if path.len() == 1 {
+                    map.entry(path[0]).or_insert(Node::Leaf(value));
+                } else {
+                    map.entry(path[0])
+                        .or_insert_with(Node::branch)
+                        .insert_first_wins(&path[1..], value);
                 }
             }
             Node::Leaf(_) => panic!("insert into a leaf"),
@@ -114,7 +138,9 @@ fn from_space(vt: ValueTransform, v: f64) -> f64 {
 /// Which of the two table shapes an op is (see the Python config module).
 pub enum Resolver {
     /// Grid-like, possibly corner-truncated tables (attention/MLA/DSA/...).
-    Grid { k_tail: usize },
+    /// `k_tail` anchors 1-D boundary holds; `nn_leaves` is the multi-axis
+    /// hold's joint-log kNN blend width (4 won the frontier-holdout LOO).
+    Grid { k_tail: usize, nn_leaves: usize },
     /// Scattered-sites-plus-curve tables (GEMM): `site_axes` identify a
     /// collected shape, each owning a sweep along `curve_axis`.
     ScatteredSites {
@@ -146,7 +172,10 @@ impl<'a> OpInterpConfig<'a> {
     pub fn grid(axes: &'static [&'static str], sol_fn: &'a dyn Fn(&[f64]) -> f64) -> Self {
         OpInterpConfig {
             axes,
-            resolver: Resolver::Grid { k_tail: 1 },
+            resolver: Resolver::Grid {
+                k_tail: 1,
+                nn_leaves: 4,
+            },
             sol_fn,
             value_transform: ValueTransform::Raw,
             transform_axis: None,
@@ -162,7 +191,10 @@ impl<'a> OpInterpConfig<'a> {
         assert!(transform_axis < axes.len());
         OpInterpConfig {
             axes,
-            resolver: Resolver::Grid { k_tail: 1 },
+            resolver: Resolver::Grid {
+                k_tail: 1,
+                nn_leaves: 4,
+            },
             sol_fn,
             value_transform: ValueTransform::Sqrt,
             transform_axis: Some(transform_axis),
@@ -350,53 +382,135 @@ fn grid_interior(
     }
 }
 
-/// Anchor past-the-frontier queries: snap to the nearest collected path, hold
-/// the boundary util (k_tail median along the innermost axis), and let
-/// SOL(query) carry the growth.
+/// Anchor past-the-frontier queries: transfer util from the `nn_leaves`
+/// nearest collected points in joint log2 space (inverse-distance^2 blend, the
+/// same transfer ScatteredSites uses between sites); latency = SOL(query)/util.
+///
+/// This replaces the earlier nearest-path snap, which was discontinuous at
+/// outer-axis midpoints (a +36.9% cliff between batch 192 and 193 on the B200
+/// generation-attention staircase) and could anchor on a frontier point in a
+/// different efficiency regime. Mirrors the Python engine's `_grid_hold`
+/// exactly (stable distance sort, skip-invalid-then-take-k selection).
+/// Single-axis tables keep the k_tail-median boundary hold.
 fn grid_hold(cfg: &OpInterpConfig, data: &Node, coords: &[f64]) -> Result<f64, AicError> {
-    let k_tail = match &cfg.resolver {
-        Resolver::Grid { k_tail } => *k_tail,
+    let (k_tail, nn_leaves) = match &cfg.resolver {
+        Resolver::Grid { k_tail, nn_leaves } => (*k_tail, *nn_leaves),
         Resolver::ScatteredSites { .. } => unreachable!("grid_hold on scattered resolver"),
     };
     let n_axes = cfg.axes.len();
-    let mut node = data;
-    let mut snapped: Vec<f64> = Vec::with_capacity(n_axes - 1);
-    for depth in 0..n_axes - 1 {
-        let map = node
-            .as_branch()
-            .ok_or_else(|| miss(cfg, coords, "table shallower than axes"))?;
-        if map.is_empty() {
-            return Err(miss(
-                cfg,
-                coords,
-                &format!("empty branch at axis '{}'", cfg.axes[depth]),
-            ));
-        }
-        let c = coords[depth];
-        let key = nearest_key(map, c);
-        snapped.push(key as f64);
-        node = &map[&key];
+    if n_axes == 1 {
+        return grid_hold_1d(cfg, data, coords, k_tail);
     }
-    let map = node
+
+    let anchors = hold_anchor_weights(cfg, data, coords, nn_leaves)?;
+    let wsum: f64 = anchors.iter().map(|a| a.weight).sum();
+    let u_acc: f64 = anchors.iter().map(|a| a.weight * (a.sol / a.latency)).sum();
+    if wsum <= 0.0 {
+        return Err(miss(cfg, coords, "no positive-util boundary anchor"));
+    }
+    let sol_q = (cfg.sol_fn)(coords);
+    if !(sol_q > 0.0) {
+        return Err(miss(cfg, coords, "non-positive SOL at query"));
+    }
+    Ok(sol_q / (u_acc / wsum))
+}
+
+/// One selected hold anchor: a measured leaf with its blend weight.
+pub(crate) struct HoldAnchor {
+    pub(crate) coords: Vec<u32>,
+    pub(crate) latency: f64,
+    pub(crate) sol: f64,
+    pub(crate) weight: f64,
+}
+
+/// The multi-axis hold's anchor selection: the `nn_leaves` nearest valid
+/// leaves in joint log2 space with their inverse-distance^2 weights.
+/// `pub(crate)` so owners that must split a summed leaf into components
+/// (wideep dispatch) reuse the engine's exact selection.
+pub(crate) fn hold_anchor_weights(
+    cfg: &OpInterpConfig,
+    data: &Node,
+    coords: &[f64],
+    nn_leaves: usize,
+) -> Result<Vec<HoldAnchor>, AicError> {
+    let mut leaves: Vec<(Vec<u32>, f64)> = Vec::new();
+    walk_leaves(data, &mut Vec::new(), &mut leaves);
+    if leaves.is_empty() {
+        return Err(miss(
+            cfg,
+            coords,
+            &format!("empty branch at axis '{}'", cfg.axes[0]),
+        ));
+    }
+    let q_log: Vec<f64> = coords.iter().map(|&v| v.max(1e-12).log2()).collect();
+    let dist = |c: &[u32]| -> f64 {
+        c.iter()
+            .zip(&q_log)
+            .map(|(&v, ql)| {
+                let d = ((v as f64).max(1e-12)).log2() - ql;
+                d * d
+            })
+            .sum::<f64>()
+            .sqrt()
+    };
+    let mut ranked: Vec<(f64, usize)> = leaves
+        .iter()
+        .enumerate()
+        .map(|(i, (c, _))| (dist(c), i))
+        .collect();
+    // Exact distance ties are real on power-of-two grids; the index tie-break
+    // is the leaf-coordinate lexicographic order (walk_leaves traverses
+    // BTreeMaps in ascending key order), matching the Python engine's
+    // explicit (distance, coords) sort key.
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut anchors: Vec<HoldAnchor> = Vec::with_capacity(nn_leaves);
+    for &(d, i) in &ranked {
+        if anchors.len() >= nn_leaves {
+            break;
+        }
+        let (c, lat) = &leaves[i];
+        let anchor: Vec<f64> = c.iter().map(|&v| v as f64).collect();
+        let sol = (cfg.sol_fn)(&anchor);
+        if !(lat.is_finite() && *lat > 0.0 && sol.is_finite() && sol > 0.0) {
+            continue;
+        }
+        anchors.push(HoldAnchor {
+            coords: c.clone(),
+            latency: *lat,
+            sol,
+            weight: 1.0 / (d * d + 1e-12),
+        });
+    }
+    if anchors.is_empty() {
+        return Err(miss(cfg, coords, "no positive-util boundary anchor"));
+    }
+    Ok(anchors)
+}
+
+/// 1-D curve past the sweep end: hold the k_tail-median boundary util.
+fn grid_hold_1d(
+    cfg: &OpInterpConfig,
+    data: &Node,
+    coords: &[f64],
+    k_tail: usize,
+) -> Result<f64, AicError> {
+    let map = data
         .as_branch()
         .ok_or_else(|| miss(cfg, coords, "table shallower than axes"))?;
     if map.is_empty() {
         return Err(miss(
             cfg,
             coords,
-            &format!("empty branch at axis '{}'", cfg.axes[n_axes - 1]),
+            &format!("empty branch at axis '{}'", cfg.axes[0]),
         ));
     }
-
     let keys: Vec<u32> = map.keys().copied().collect();
-    let c = coords[n_axes - 1];
+    let c = coords[0];
     let tail: Vec<u32> = if c > keys[keys.len() - 1] as f64 {
         keys[keys.len().saturating_sub(k_tail)..].to_vec()
-    } else if c < keys[0] as f64 {
-        keys[..k_tail.min(keys.len())].to_vec()
     } else {
-        // innermost is in range; an OUTER axis was snapped
-        vec![nearest_key(map, c)]
+        keys[..k_tail.min(keys.len())].to_vec()
     };
 
     let mut utils: Vec<f64> = Vec::with_capacity(tail.len());
@@ -404,9 +518,7 @@ fn grid_hold(cfg: &OpInterpConfig, data: &Node, coords: &[f64]) -> Result<f64, A
         let Some(lat) = map[&t].as_leaf() else {
             continue;
         };
-        let mut anchor = snapped.clone();
-        anchor.push(t as f64);
-        let sol = (cfg.sol_fn)(&anchor);
+        let sol = (cfg.sol_fn)(&[t as f64]);
         if lat > 0.0 && sol > 0.0 {
             utils.push(sol / lat);
         }
@@ -419,16 +531,6 @@ fn grid_hold(cfg: &OpInterpConfig, data: &Node, coords: &[f64]) -> Result<f64, A
         return Err(miss(cfg, coords, "non-positive SOL at query"));
     }
     Ok(sol_q / median(&mut utils))
-}
-
-fn nearest_key(map: &BTreeMap<u32, Node>, c: f64) -> u32 {
-    *map.keys()
-        .min_by(|a, b| {
-            let da = (**a as f64 - c).abs();
-            let db = (**b as f64 - c).abs();
-            da.total_cmp(&db)
-        })
-        .expect("nearest_key on empty map")
 }
 
 fn median(values: &mut [f64]) -> f64 {
@@ -564,14 +666,25 @@ impl SiteIndex {
         // tie-break reproduces the previous *stable* sort's order on equal
         // distances (sites are pushed in ascending-index order), so the selected
         // set and its ordering are identical.
-        if let Some(gate) = max_site_distance {
-            ranked.retain(|&(d, _)| d <= *gate);
-            if ranked.is_empty() {
-                return Err(miss(cfg, coords, "no site within max_site_distance"));
-            }
-        }
         let cmp =
             |a: &(f64, usize), b: &(f64, usize)| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1));
+        if let Some(gate) = max_site_distance {
+            if ranked.iter().any(|&(d, _)| d <= *gate) {
+                ranked.retain(|&(d, _)| d <= *gate);
+            } else {
+                // The gate is waived for a query site beyond the collected
+                // frontier in the scale-up direction (big-vocab LM heads at
+                // low tp): anchors are the coverage-eligible sites that still
+                // pass the gate on the non-overflow axes, and SOL(query)
+                // carries the growth. Interior holes, scale-down / mixed
+                // queries, and sparse-stub multi-axis overflow keep the miss.
+                let q_site: Vec<f64> = site_axes.iter().map(|&p| coords[p]).collect();
+                match self.frontier_waiver_anchors(&ranked, &q_site, &q_log, *gate) {
+                    Some(admissible) => ranked = admissible,
+                    None => return Err(miss(cfg, coords, "no site within max_site_distance")),
+                }
+            }
+        }
         let k = (*nn_sites).min(ranked.len());
         if k < ranked.len() {
             ranked.select_nth_unstable_by(k, cmp);
@@ -608,6 +721,77 @@ impl SiteIndex {
             return Err(miss(cfg, coords, "non-positive SOL at query"));
         }
         Ok(sol_q / (u_acc / wsum))
+    }
+
+    /// Anchor set for a scale-up frontier query, or None (gate miss stands).
+    ///
+    /// The distance gate is waived ONLY for the intended frontier overflow,
+    /// and everything is computed over `candidates` (the coverage-eligible
+    /// `(full distance, site index)` buffer from `resolve`) so admissibility
+    /// and the anchors actually used cannot diverge:
+    ///
+    /// - exactly ONE site axis overflows (strictly above the candidates'
+    ///   maximum). Simultaneous multi-axis overflow means the table is a
+    ///   sparse stub for this shape (e.g. an fp8_block table collected at
+    ///   n,k<=128 queried with a real logits GEMM) — holding a launch-bound
+    ///   stub's util across many octaves fabricates arbitrarily wrong
+    ///   latencies, so it stays a miss;
+    /// - no axis sits below the candidates' minimum (scale-down never
+    ///   transfers);
+    /// - the NON-overflow axes still pass the gate (residual log2 distance),
+    ///   so anchors are genuine frontier neighbours of the query and the
+    ///   transfer is scale-up along the overflow axis only.
+    ///
+    /// On the overflow axis every anchor is below the query by construction;
+    /// the caller's inverse-distance weighting then favours the largest
+    /// collected sites, and SOL(query) carries the growth (the same trust as
+    /// the m curve axis and the grid out-of-range hold).
+    fn frontier_waiver_anchors(
+        &self,
+        candidates: &[(f64, usize)],
+        q_site: &[f64],
+        q_log: &[f64],
+        gate: f64,
+    ) -> Option<Vec<(f64, usize)>> {
+        let axes = q_site.len();
+        let mut overflow: Vec<usize> = Vec::new();
+        for a in 0..axes {
+            let (mut lo, mut hi) = (u32::MAX, 0u32);
+            for &(_, i) in candidates {
+                let key = &self.site_logs[i].0;
+                lo = lo.min(key[a]);
+                hi = hi.max(key[a]);
+            }
+            if q_site[a] < lo as f64 {
+                return None;
+            }
+            if q_site[a] > hi as f64 {
+                overflow.push(a);
+            }
+        }
+        if overflow.len() != 1 {
+            return None;
+        }
+        let resid_dist = |i: usize| -> f64 {
+            (0..axes)
+                .filter(|a| !overflow.contains(a))
+                .map(|a| {
+                    let d = self.site_logs[i].1[a] - q_log[a];
+                    d * d
+                })
+                .sum::<f64>()
+                .sqrt()
+        };
+        let admissible: Vec<(f64, usize)> = candidates
+            .iter()
+            .copied()
+            .filter(|&(_, i)| resid_dist(i) <= gate)
+            .collect();
+        if admissible.is_empty() {
+            None
+        } else {
+            Some(admissible)
+        }
     }
 
     /// Evaluate one site's curve at coordinate `q`.
@@ -804,6 +988,75 @@ mod tests {
         assert!(query(&cfg, &t, &[8.0, 512.0, 1.0]).is_err());
     }
 
+    // Multi-axis hold: joint-log2 kNN util transfer (the B200 gen-attn report
+    // case). Staircase with a REGIME SPLIT: the deep b=128 row is collected at
+    // exact physics while the short b=256 row ends early in a 1.4x-latency
+    // regime (like the real 128K-token-capped b>=256 rows). Every query below
+    // is past the frontier on both rows.
+    fn gen_lat(c: &[f64]) -> f64 {
+        1e-6 * c[0] * c[1] * c[2] // decode physics: [n][b][s], linear in both
+    }
+
+    fn gen_split_table() -> Node {
+        let mut root = Node::branch();
+        for s in [512u32, 1024, 2048] {
+            root.insert(&[64, 128, s], gen_lat(&[64.0, 128.0, s as f64]));
+        }
+        for s in [128u32, 256, 512] {
+            root.insert(&[64, 256, s], 1.4 * gen_lat(&[64.0, 256.0, s as f64]));
+        }
+        root
+    }
+
+    #[test]
+    fn grid_hold_is_continuous_across_outer_midpoint() {
+        // The nearest-path snap flipped anchors at the bracket midpoint
+        // (b=192 -> row 128, b=193 -> row 256), a +36.9% cliff on the real
+        // B200 table where measured hardware moves +0.17%. The kNN hold must
+        // stay continuous: the 192->193 step may not exceed the SOL growth by
+        // more than a percent.
+        let t = gen_split_table();
+        let cfg = OpInterpConfig::grid(&["num_heads", "batch", "seq_len"], &gen_lat);
+        let lat_192 = query(&cfg, &t, &[64.0, 192.0, 4096.0]).unwrap();
+        let lat_193 = query(&cfg, &t, &[64.0, 193.0, 4096.0]).unwrap();
+        let sol_step = gen_lat(&[64.0, 193.0, 4096.0]) / gen_lat(&[64.0, 192.0, 4096.0]);
+        assert!((lat_193 / lat_192 - sol_step).abs() < 0.01);
+    }
+
+    #[test]
+    fn grid_hold_prefers_nearby_saturated_evidence() {
+        // A query deep past the short row's end (b=256, s=4096) must not
+        // inherit that row's unsaturated 1.4x boundary util verbatim (the old
+        // snap did, +41% on the reported B200 case): the joint-log nearest
+        // leaves are the deep saturated ones, so the answer lands near physics.
+        let t = gen_split_table();
+        let cfg = OpInterpConfig::grid(&["num_heads", "batch", "seq_len"], &gen_lat);
+        let lat = query(&cfg, &t, &[64.0, 256.0, 4096.0]).unwrap();
+        let ratio = lat / gen_lat(&[64.0, 256.0, 4096.0]);
+        assert!(ratio < 1.15, "snap gave 1.4x, got {ratio}");
+        assert!(ratio > 0.95, "got {ratio}");
+    }
+
+    #[test]
+    fn grid_hold_is_axis_order_independent() {
+        // The hold works on joint coordinates, not the nesting order: the
+        // same data nested [n][b][s] and [n][s][b] must answer a past-frontier
+        // query identically.
+        let t = gen_split_table();
+        let cfg = OpInterpConfig::grid(&["num_heads", "batch", "seq_len"], &gen_lat);
+        let mut swapped = Node::branch();
+        let mut leaves: Vec<(Vec<u32>, f64)> = Vec::new();
+        walk_leaves(&t, &mut Vec::new(), &mut leaves);
+        for (c, lat) in &leaves {
+            swapped.insert(&[c[0], c[2], c[1]], *lat);
+        }
+        let sol_swapped = |c: &[f64]| gen_lat(&[c[0], c[2], c[1]]);
+        let cfg_swapped = OpInterpConfig::grid(&["num_heads", "seq_len", "batch"], &sol_swapped);
+        let lat = query(&cfg, &t, &[64.0, 200.0, 4096.0]).unwrap();
+        let lat_swapped = query(&cfg_swapped, &swapped, &[64.0, 4096.0, 200.0]).unwrap();
+        assert!((lat - lat_swapped).abs() <= 1e-12 * lat.abs());
+    }
+
     // 4-axis (DSA/CSA-like): [num_heads][prefix][seq][batch]
     fn dsa_lat(c: &[f64]) -> f64 {
         1e-6 * c[0] * c[3] * c[2] * (c[2] + c[1])
@@ -945,6 +1198,93 @@ mod tests {
         let cfg = gemm_cfg(&gemm_lat);
         // (64, 64): > 2 octaves from every collected site -> miss, not a guess.
         assert!(query(&cfg, &t, &[64.0, 64.0, 64.0]).is_err());
+    }
+
+    #[test]
+    fn gemm_scale_up_beyond_frontier_holds_util() {
+        // Gemma-4-26B-A4B tp1 LM head (issue #1415): (n=262144, k=2816) is
+        // ~2.005 octaves from the nearest collected site — past the distance
+        // gate — but beyond the frontier in the scale-up direction, so the
+        // engine holds the frontier util instead of missing. util==1 fixture
+        // -> the hold is exact.
+        let mut t = Node::branch();
+        for m in [16u32, 32, 64] {
+            for &(n, k) in &[(65536u32, 2560u32), (65536, 3072), (4096, 2816)] {
+                t.insert(&[m, n, k], gemm_lat(&[m as f64, n as f64, k as f64]));
+            }
+        }
+        let cfg = gemm_cfg(&gemm_lat);
+        approx(
+            query(&cfg, &t, &[32.0, 262144.0, 2816.0]).unwrap(),
+            gemm_lat(&[32.0, 262144.0, 2816.0]),
+        );
+    }
+
+    #[test]
+    fn gemm_interior_hole_beyond_gate_still_misses() {
+        // (8192, 8192) is dominated by the collected (65536, 65536) corner but
+        // >2 octaves from every site — a sparse interior hole, not a frontier
+        // query. The gate must still refuse to guess.
+        let mut t = Node::branch();
+        for m in [16u32, 32, 64] {
+            for &(n, k) in &[(256u32, 256u32), (65536, 65536)] {
+                t.insert(&[m, n, k], gemm_lat(&[m as f64, n as f64, k as f64]));
+            }
+        }
+        let cfg = gemm_cfg(&gemm_lat);
+        assert!(query(&cfg, &t, &[32.0, 8192.0, 8192.0]).is_err());
+    }
+
+    #[test]
+    fn gemm_incomparable_notch_inside_bounding_box_still_misses() {
+        // (4096, 4096) sits in the notch between (256, 65536) and (65536,
+        // 256): no site dominates it, yet it exceeds the collected maximum on
+        // NO axis — an interior hole in the Pareto staircase, not a scale-up
+        // frontier query. The waiver must not fire; the gate stands.
+        let mut t = Node::branch();
+        for m in [16u32, 32, 64] {
+            for &(n, k) in &[(256u32, 65536u32), (65536, 256)] {
+                t.insert(&[m, n, k], gemm_lat(&[m as f64, n as f64, k as f64]));
+            }
+        }
+        let cfg = gemm_cfg(&gemm_lat);
+        assert!(query(&cfg, &t, &[32.0, 4096.0, 4096.0]).is_err());
+    }
+
+    #[test]
+    fn gemm_sparse_stub_multi_axis_overflow_still_misses() {
+        // Real-table regression (PR #1419 review): an fp8_block-like stub
+        // collected only at n,k in 32..128 queried with a real logits GEMM
+        // (m=1, n=151936, k=5120) — BOTH site axes past the collected
+        // maximum. Simultaneous multi-axis overflow must stay a miss.
+        let mut t = Node::branch();
+        for m in [1u32, 2, 4] {
+            for n in [32u32, 64, 128] {
+                for k in [32u32, 64, 128] {
+                    t.insert(&[m, n, k], gemm_lat(&[m as f64, n as f64, k as f64]));
+                }
+            }
+        }
+        let cfg = gemm_cfg(&gemm_lat);
+        assert!(query(&cfg, &t, &[1.0, 151936.0, 5120.0]).is_err());
+    }
+
+    #[test]
+    fn gemm_waiver_admissibility_computed_over_coverage_candidates() {
+        // PR #1419 review: site (1, 1) covers only m<=2, site (64, 64) covers
+        // m=16..64. Query (m=32, n=1024, k=1) used to pass a GLOBAL frontier
+        // check while the only coverage-eligible anchor (64, 64) required a
+        // k=64 -> k=1 scale-DOWN transfer. Admissibility over the coverage
+        // candidates puts k=1 below the minimum -> miss.
+        let mut t = Node::branch();
+        for m in [1u32, 2] {
+            t.insert(&[m, 1, 1], gemm_lat(&[m as f64, 1.0, 1.0]));
+        }
+        for m in [16u32, 32, 64] {
+            t.insert(&[m, 64, 64], gemm_lat(&[m as f64, 64.0, 64.0]));
+        }
+        let cfg = gemm_cfg(&gemm_lat);
+        assert!(query(&cfg, &t, &[32.0, 1024.0, 1.0]).is_err());
     }
 
     #[test]

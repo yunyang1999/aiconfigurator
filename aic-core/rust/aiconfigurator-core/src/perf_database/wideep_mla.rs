@@ -707,7 +707,7 @@ mod tests {
         let ctx_cases: &[(u32, u32, f64)] = &[
             (4, 4096, 9.6274),             // exact hit
             (4, 6000, 16.671686220608603), // seq interior (sqrt blend)
-            (4, 50000, 699.5122474936111), // beyond seq range (util-hold)
+            (4, 50000, 695.1030924816868), // beyond seq range (kNN util-hold)
         ];
         for &(b, s, expected) in ctx_cases {
             let got = table
@@ -729,7 +729,7 @@ mod tests {
         let gen_cases: &[(u32, u32, f64)] = &[
             (1, 4096, 0.1017),               // exact hit
             (1, 3000, 0.09988046874999999),  // seq interior (raw blend)
-            (1, 100000, 0.17286183638702504), // beyond seq range (util-hold)
+            (1, 100000, 0.1889099326145589), // beyond seq range (kNN util-hold)
         ];
         for &(b, s, expected) in gen_cases {
             let got = table

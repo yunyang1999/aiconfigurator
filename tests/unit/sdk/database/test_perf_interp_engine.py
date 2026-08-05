@@ -193,6 +193,73 @@ def test_grid_empty_table_is_a_miss():
         perf_interp.query(_attn_cfg(), {}, 8, 512, 1)
 
 
+# ---------------------------------------------------------------------------
+# Multi-axis hold: joint-log kNN util transfer (the B200 gen-attn report case)
+# ---------------------------------------------------------------------------
+#
+# Staircase with a REGIME SPLIT: the deep row (b=128) is collected at exact
+# physics (saturated, util 1) while the short row (b=256) ends early in a
+# 1.4x-latency regime (unsaturated row end, like the real 128K-token-capped
+# b>=256 rows). Every query below is past the frontier on both rows.
+
+
+def _gen_lat(n, b, s):
+    return 1e-6 * n * b * s  # decode physics: linear in both
+
+
+def _gen_cfg():
+    return perf_interp.generation_attention_config(sol_fn=_gen_lat)
+
+
+def _gen_split_table():
+    table = {64: {}}
+    table[64][128] = {s: {"latency": _gen_lat(64, 128, s), "energy": 0.0} for s in (512, 1024, 2048)}
+    table[64][256] = {s: {"latency": 1.4 * _gen_lat(64, 256, s), "energy": 0.0} for s in (128, 256, 512)}
+    return table
+
+
+def test_grid_hold_is_continuous_across_outer_midpoint():
+    """The nearest-path snap flipped anchors at the bracket midpoint (b=192 ->
+    row 128, b=193 -> row 256), a +36.9% cliff on the real B200 table where
+    measured hardware moves +0.17%. The kNN hold must stay continuous: the
+    192->193 step may not exceed the SOL growth by more than a percent."""
+    table = _gen_split_table()
+    lat_192 = _lat(perf_interp.query(_gen_cfg(), table, 64, 192, 4096))
+    lat_193 = _lat(perf_interp.query(_gen_cfg(), table, 64, 193, 4096))
+    sol_step = _gen_lat(64, 193, 4096) / _gen_lat(64, 192, 4096)
+    assert lat_193 / lat_192 == pytest.approx(sol_step, abs=0.01)
+
+
+def test_grid_hold_prefers_nearby_saturated_evidence():
+    """A query deep past the short row's end (b=256, s=4096) must not inherit
+    that row's unsaturated 1.4x boundary util verbatim (the old snap did,
+    +41% on the reported B200 case): the joint-log nearest leaves are the deep
+    saturated ones, so the answer lands near physics."""
+    lat = _lat(perf_interp.query(_gen_cfg(), _gen_split_table(), 64, 256, 4096))
+    assert lat / _gen_lat(64, 256, 4096) < 1.15  # snap gave 1.4x
+    assert lat / _gen_lat(64, 256, 4096) > 0.95
+
+
+def test_grid_hold_is_axis_order_independent():
+    """The hold works on joint coordinates, not the nesting order: the same
+    data nested [n][b][s] and [n][s][b] must answer a past-frontier query
+    identically (this is what makes the generation and context table layouts
+    behave the same past the staircase)."""
+    table = _gen_split_table()
+    swapped = {64: {}}
+    for b, row in table[64].items():
+        for s, leaf in row.items():
+            swapped[64].setdefault(s, {})[b] = leaf
+    cfg_swapped = perf_interp.OpInterpConfig(
+        axes=("num_heads", "seq_len", "batch"),
+        resolver=perf_interp.Grid(),
+        sol_fn=lambda n, s, b: _gen_lat(n, b, s),
+    )
+    lat = _lat(perf_interp.query(_gen_cfg(), table, 64, 200, 4096))
+    lat_swapped = _lat(perf_interp.query(cfg_swapped, swapped, 64, 4096, 200))
+    assert lat == pytest.approx(lat_swapped, rel=1e-9)
+
+
 def test_config_rejects_bad_transform_axis_and_k_tail():
     with pytest.raises(ValueError, match="transform_axis"):
         perf_interp.OpInterpConfig(
@@ -206,6 +273,12 @@ def test_config_rejects_bad_transform_axis_and_k_tail():
         perf_interp.OpInterpConfig(
             axes=("num_heads", "seq_len", "batch"),
             resolver=perf_interp.Grid(k_tail=0),
+            sol_fn=_attn_lat,
+        )
+    with pytest.raises(ValueError, match="nn_leaves"):
+        perf_interp.OpInterpConfig(
+            axes=("num_heads", "seq_len", "batch"),
+            resolver=perf_interp.Grid(nn_leaves=0),
             sol_fn=_attn_lat,
         )
     with pytest.raises(ValueError, match="duplicate"):

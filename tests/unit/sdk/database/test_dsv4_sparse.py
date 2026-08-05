@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import math
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -64,9 +66,9 @@ def _ctx_row(
     model: str = _FLASH_MODEL,
     num_heads: int | None = None,
 ) -> str:
-    # SCHEME A: the collector writes the rank-LOCAL head count (native // tp);
-    # callers may override it to simulate different shardings on one model.
-    heads = _native_heads_for_model(model) // tp if num_heads is None else num_heads
+    # The collector writes rank-LOCAL heads (native // tp, the unified #1429
+    # convention); callers may override to simulate malformed files.
+    heads = max(1, _native_heads_for_model(model) // tp) if num_heads is None else num_heads
     return (
         f"SGLang,test,NVIDIA H20-3e,dsv4_{attn_kind}_context_module,"
         f"compressed_flashmla,{model},DeepseekV4ForCausalLM,"
@@ -85,11 +87,14 @@ def _gen_row(
     gemm: str = "fp8_block",
     lat: float = 0.1,
     model: str = _FLASH_MODEL,
+    num_heads: int | None = None,
+    version: str = "test",
 ) -> str:
+    heads = max(1, _native_heads_for_model(model) // tp) if num_heads is None else num_heads
     return (
-        f"SGLang,test,NVIDIA H20-3e,dsv4_{attn_kind}_generation_module,"
+        f"SGLang,{version},NVIDIA H20-3e,dsv4_{attn_kind}_generation_module,"
         f"compressed_flashmla,{model},DeepseekV4ForCausalLM,"
-        f"bfloat16,fp8_e4m3,{gemm},{_native_heads_for_model(model)},{bs},{isl},{tp},{step},{cr},{lat:.4f}"
+        f"bfloat16,fp8_e4m3,{gemm},{heads},{bs},{isl},{tp},{step},{cr},{lat:.4f}"
     )
 
 
@@ -160,38 +165,31 @@ def test_load_dsv4_sparse_kernel_data_missing_returns_none(tmp_path):
 # ───────────────────────────────────────────────────────────────────────
 
 
-def test_load_context_dsv4_kind_module_data_keys_by_local_head(tmp_path):
-    """SCHEME A: TP is folded into the rank-LOCAL ``num_heads`` (native // tp),
-    so the loader keys the head axis by local head count — there is NO separate
-    tp_size key. Axis order after the head is [cr][prefix][s][b]."""
+def test_load_context_dsv4_kind_module_data_keys_by_native_and_local_head(tmp_path):
+    """The files' ``num_heads`` column is the rank-LOCAL head count (#1429
+    unified convention); the loader derives the model-native count
+    ``num_heads * tp_size`` and keys the head identity as [native][local].
+    Axis order after the heads is [cr][prefix][s][b]."""
     # Pro native=128 sharded at tp=1/2/4/8 -> local heads 128/64/32/16.
     rows = [
-        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=1, lat=18.0, model=_PRO_MODEL, num_heads=128),
-        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=2, lat=14.0, model=_PRO_MODEL, num_heads=64),
-        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=4, lat=11.5, model=_PRO_MODEL, num_heads=32),
-        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=8, lat=10.5, model=_PRO_MODEL, num_heads=16),
-        _ctx_row(
-            attn_kind="csa",
-            cr=4,
-            bs=1,
-            isl=8192,
-            tp=8,
-            step=128,
-            lat=12.5,
-            model=_PRO_MODEL,
-            num_heads=16,
-        ),
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=1, lat=18.0, model=_PRO_MODEL),
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=2, lat=14.0, model=_PRO_MODEL),
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=4, lat=11.5, model=_PRO_MODEL),
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=8, lat=10.5, model=_PRO_MODEL),
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=8, step=128, lat=12.5, model=_PRO_MODEL),
     ]
     path = _write_csv(tmp_path / "csa_ctx.txt", _CTX_HEADER, rows)
     data = load_context_dsv4_kind_module_data(path)
     quant = data[common.FMHAQuantMode.bfloat16][common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
-    # head axis keyed by local head count {128, 64, 32, 16} (no tp_size axis)
-    assert set(quant.keys()) == {128, 64, 32, 16}
-    # axis order after the head is [cr][prefix][s][b]
-    assert quant[16][4][0][8192][1]["latency"] == pytest.approx(10.5)
-    assert quant[16][4][128][8192][1]["latency"] == pytest.approx(12.5)
+    # one native bucket (Pro=128) with the tp sweep as local keys
+    assert set(quant.keys()) == {_PRO_NATIVE_HEADS}
+    locals_ = quant[_PRO_NATIVE_HEADS]
+    assert set(locals_.keys()) == {128, 64, 32, 16}
+    # axis order after the heads is [cr][prefix][s][b]
+    assert locals_[16][4][0][8192][1]["latency"] == pytest.approx(10.5)
+    assert locals_[16][4][128][8192][1]["latency"] == pytest.approx(12.5)
     # more local heads (less sharded) is slower
-    assert quant[128][4][0][8192][1]["latency"] > quant[16][4][0][8192][1]["latency"]
+    assert locals_[128][4][0][8192][1]["latency"] > locals_[16][4][0][8192][1]["latency"]
 
 
 def test_load_generation_dsv4_kind_module_data_b_before_s(tmp_path):
@@ -207,8 +205,9 @@ def test_load_generation_dsv4_kind_module_data_b_before_s(tmp_path):
     ]
     path = _write_csv(tmp_path / "csa_gen.txt", _CTX_HEADER, rows)
     data = load_generation_dsv4_kind_module_data(path)
-    sub = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block][_FLASH_NATIVE_HEADS][4]
-    # SCHEME A axis order after [head][cr] is [b][s_total] (no tp axis); b first
+    # tp=1 rows -> local == native; axis order [native][local][cr][b][s_total]
+    sub = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block][_FLASH_NATIVE_HEADS][_FLASH_NATIVE_HEADS][4]
+    # axis order after [native][local][cr] is [b][s_total]; b first
     s_total_short = 1 + 1023  # isl + step
     s_total_long = 1 + 8191
     assert sub[1][s_total_short]["latency"] == pytest.approx(0.1)
@@ -224,9 +223,9 @@ def test_load_context_dsv4_kind_module_data_keeps_native_heads_separate(tmp_path
     path = _write_csv(tmp_path / "csa_ctx_models.txt", _CTX_HEADER, rows)
     data = load_context_dsv4_kind_module_data(path)
     data = data[common.FMHAQuantMode.bfloat16][common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
-    # SCHEME A: [local_head][cr][prefix][s][b]; tp=1 rows -> local head == native, prefix=0
-    assert data[_FLASH_NATIVE_HEADS][4][0][8192][1]["latency"] == pytest.approx(18.0)
-    assert data[_PRO_NATIVE_HEADS][4][0][8192][1]["latency"] == pytest.approx(23.0)
+    # [native][local][cr][prefix][s][b]; tp=1 rows -> local == native, prefix=0
+    assert data[_FLASH_NATIVE_HEADS][_FLASH_NATIVE_HEADS][4][0][8192][1]["latency"] == pytest.approx(18.0)
+    assert data[_PRO_NATIVE_HEADS][_PRO_NATIVE_HEADS][4][0][8192][1]["latency"] == pytest.approx(23.0)
 
 
 def test_load_generation_dsv4_kind_module_data_keeps_native_heads_separate(tmp_path):
@@ -237,9 +236,9 @@ def test_load_generation_dsv4_kind_module_data_keeps_native_heads_separate(tmp_p
     path = _write_csv(tmp_path / "hca_gen_models.txt", _CTX_HEADER, rows)
     data = load_generation_dsv4_kind_module_data(path)
     data = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
-    # SCHEME A: [local_head][cr][b][s_total]; tp=1 -> local head == native, no tp axis
-    assert data[_FLASH_NATIVE_HEADS][128][1][1024]["latency"] == pytest.approx(0.2)
-    assert data[_PRO_NATIVE_HEADS][128][1][1024]["latency"] == pytest.approx(0.6)
+    # [native][local][cr][b][s_total]; tp=1 -> local == native
+    assert data[_FLASH_NATIVE_HEADS][_FLASH_NATIVE_HEADS][128][1][1024]["latency"] == pytest.approx(0.2)
+    assert data[_PRO_NATIVE_HEADS][_PRO_NATIVE_HEADS][128][1][1024]["latency"] == pytest.approx(0.6)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -286,6 +285,21 @@ def _make_sparse_db_with_paged_mqa(tmp_path, *, lat_at_past0: float, lat_at_past
 
 def _sparse_value(latency: float) -> dict[str, float]:
     return {"latency": latency}
+
+
+def _pair_sol(past: float, isl: float, bs: float) -> float:
+    """The sparse kernel's pair-count SOL: bs * (past*isl + isl^2/2)."""
+    return bs * (past * isl + isl * isl / 2)
+
+
+def _knn_hold(leaves, sol, query, k=4):
+    """Independent reference for the multi-axis past-frontier hold: util from
+    the k nearest leaves in joint log2 space, inverse-distance^2 blend."""
+    logq = [math.log2(max(v, 1e-12)) for v in query]
+    scored = sorted((math.dist([math.log2(max(v, 1e-12)) for v in c], logq), sol(*c) / lat) for c, lat in leaves)[:k]
+    wsum = sum(1.0 / (d * d + 1e-12) for d, _ in scored)
+    util = sum(u / (d * d + 1e-12) for d, u in scored) / wsum
+    return sol(*query) / util
 
 
 def _sparse_sampled_batch_caps_grid(*, offset: float = 0.0) -> dict:
@@ -430,11 +444,13 @@ def test_lookup_sparse_kernel_holds_util_on_isolated_leaves():
     """Two isolated leaves that bracket past_kv but share no (isl, batch) grid.
 
     Neither past_kv branch can resolve (isl=1536, bs=2) in-data, so the engine
-    falls to util-hold: snap outer axes to the nearest collected path
-    (past=0 -> isl=1024), anchor util on its boundary leaf b=1
-    (util = SOL(0,1024,1)/1.0 = 1024^2/2), and scale by the pair-count SOL at
-    the query: SOL(2048,1536,2)/util = 8650752/524288 = 16.5.
-    (Previously this cloud went to scattered cubic griddata.)
+    falls to util-hold: blend utils from the nearest leaves in joint log2
+    space. (4096, 2048, 2) is ~1 octave away while (0, 1024, 1) is ~50 "octaves"
+    away on the past axis (0 vs 2048 is a regime change, not a distance), so
+    the fully-specified leaf dominates. The earlier nearest-path snap picked
+    the past=0 leaf on a coin-flip tie (|0-2048| == |4096-2048|) and answered
+    with a 10x-different util. (Before that, this cloud went to scattered
+    cubic griddata.)
     """
 
     class _DB:
@@ -463,9 +479,12 @@ def test_lookup_sparse_kernel_holds_util_on_isolated_leaves():
         native_heads=_FLASH_NATIVE_HEADS,
     )
 
-    sol_q = 2 * (2048 * 1536 + 1536**2 / 2)
-    anchor_util = 1 * (1024**2 / 2) / 1.0
-    assert val == pytest.approx(sol_q / anchor_util)  # 16.5
+    expected = _knn_hold(
+        [((0, 1024, 1), 1.0), ((4096, 2048, 2), 4.0)],
+        _pair_sol,
+        (2048, 1536, 2),
+    )
+    assert val == pytest.approx(expected)  # ~1.65, dominated by the near leaf
 
 
 def test_lookup_sparse_kernel_brackets_batch_and_drops_ragged_isl_branch():
@@ -501,10 +520,11 @@ def test_lookup_sparse_kernel_holds_util_beyond_all_batches():
     """bs=5 exceeds every collected batch at every isl -> util-hold.
 
     No isl branch covers bs=5 so in-data resolution fails entirely. The hold
-    snaps isl to the nearest collected row (2048), anchors util on its
-    boundary batch b=4 (util = SOL(0,2048,4)/8.0), and scales by the
-    pair-count SOL at the query, so the isl growth 2048->2682 rides the
-    quadratic SOL rather than a linear batch extrapolation.
+    blends utils from the nearest measured leaves in joint log2 space (the
+    (2048, 4) corner dominates, with its (2048, 2) and (1024, 8) neighbours
+    contributing) and scales by the pair-count SOL at the query, so the isl
+    growth 2048->2682 rides the quadratic SOL rather than a linear batch
+    extrapolation.
     """
     db = _make_sparse_db_from_grid({0: _sparse_sampled_batch_caps_grid()})
     val = ContextDeepSeekV4AttentionModule._lookup_sparse_kernel(
@@ -517,9 +537,10 @@ def test_lookup_sparse_kernel_holds_util_beyond_all_batches():
         native_heads=_FLASH_NATIVE_HEADS,
     )
 
-    anchor_util = 4 * (2048**2 / 2) / 8.00
-    sol_q = 5 * (2682**2 / 2)
-    assert val == pytest.approx(sol_q / anchor_util, rel=1e-4)  # ~17.15
+    grid = _sparse_sampled_batch_caps_grid()
+    leaves = [((0, isl, b), grid[isl][b]["latency"]) for isl in grid for b in grid[isl]]
+    expected = _knn_hold(leaves, _pair_sol, (0, 2682, 5))
+    assert val == pytest.approx(expected, rel=1e-4)  # ~15.9
 
 
 def test_lookup_sparse_kernel_brackets_batch_within_covering_isl_row():
@@ -706,3 +727,199 @@ def test_topk_512_io_formula_scales_linearly_with_past_kv():
     delta_8k = M * 8192 / (mem_bw * 0.1) * 1000.0
     delta_16k = M * 16384 / (mem_bw * 0.1) * 1000.0
     assert delta_16k == pytest.approx(2 * delta_8k, rel=1e-9)
+
+
+def test_load_dsv4_kind_module_data_rejects_stale_native_semantics(tmp_path):
+    """Files still storing the pre-#1131 NATIVE convention — ``num_heads``
+    constant across a tp sweep — must fail loudly instead of collapsing tp
+    shards onto wrong (native, local) coordinates.  The shipped sglang 0.5.10
+    tables were migrated in-place (#1429); this guards against unmigrated
+    external files."""
+    ctx_rows = [
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=1, lat=18.0, model=_PRO_MODEL, num_heads=128),
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=8, lat=10.5, model=_PRO_MODEL, num_heads=128),
+    ]
+    path = _write_csv(tmp_path / "csa_ctx_stale.txt", _CTX_HEADER, ctx_rows)
+    with pytest.raises(ValueError, match="pre-#1131 NATIVE semantics"):
+        load_context_dsv4_kind_module_data(path)
+
+    gen_rows = [
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.5, model=_PRO_MODEL, num_heads=128),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=8, lat=0.3, model=_PRO_MODEL, num_heads=128),
+    ]
+    path = _write_csv(tmp_path / "hca_gen_stale.txt", _CTX_HEADER, gen_rows)
+    with pytest.raises(ValueError, match="pre-#1131 NATIVE semantics"):
+        load_generation_dsv4_kind_module_data(path)
+
+
+def test_load_dsv4_kind_module_data_stale_guard_is_per_model(tmp_path):
+    """The stale-NATIVE guard fingerprints each model separately: one stale
+    artifact fails the load even when another model's rows are well-formed,
+    and two well-formed models bucket into their own [native][local] cells."""
+    stale_plus_good = [
+        # Pro written native-style (constant 128 across tp) -> stale.
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.5, model=_PRO_MODEL, num_heads=128),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=8, lat=0.3, model=_PRO_MODEL, num_heads=128),
+        # Flash written local-style (64/tp) -> fine on its own.
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.4, model=_FLASH_MODEL),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=8, lat=0.2, model=_FLASH_MODEL),
+    ]
+    path = _write_csv(tmp_path / "hca_gen_mixed.txt", _CTX_HEADER, stale_plus_good)
+    with pytest.raises(ValueError, match="DeepSeek-V4-Pro"):
+        load_generation_dsv4_kind_module_data(path)
+
+    good_rows = [
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.5, model=_PRO_MODEL),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=8, lat=0.3, model=_PRO_MODEL),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.4, model=_FLASH_MODEL),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=8, lat=0.2, model=_FLASH_MODEL),
+    ]
+    path = _write_csv(tmp_path / "hca_gen_two_models.txt", _CTX_HEADER, good_rows)
+    data = load_generation_dsv4_kind_module_data(path)
+    q = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
+    assert q[_PRO_NATIVE_HEADS][64][128][1][1024]["latency"] == pytest.approx(0.5)  # Pro tp2 -> local 64
+    assert q[_PRO_NATIVE_HEADS][16][128][1][1024]["latency"] == pytest.approx(0.3)  # Pro tp8 -> local 16
+    assert q[_FLASH_NATIVE_HEADS][32][128][1][1024]["latency"] == pytest.approx(0.4)  # Flash tp2
+    assert q[_FLASH_NATIVE_HEADS][8][128][1][1024]["latency"] == pytest.approx(0.2)  # Flash tp8
+
+
+def test_load_dsv4_kind_module_data_stale_guard_is_per_version(tmp_path):
+    """The stale-NATIVE fingerprint is checked per (model, version): the
+    shared layer pools sibling-version files into one row stream, so a stale
+    native-writing sibling of the SAME model must be caught even when the
+    pooled union of both versions no longer looks heads-constant."""
+    rows = [
+        # stale sibling version: native semantics (heads constant across tp).
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.5, num_heads=64, version="0.5.10"),
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=8, lat=0.3, num_heads=64, version="0.5.10"),
+        # migrated primary version: local semantics (heads = 64 // tp).
+        _gen_row(attn_kind="hca", cr=128, bs=2, isl=1, step=1023, tp=2, lat=0.4, num_heads=32, version="0.5.16"),
+        _gen_row(attn_kind="hca", cr=128, bs=2, isl=1, step=1023, tp=8, lat=0.2, num_heads=8, version="0.5.16"),
+    ]
+    path = _write_csv(tmp_path / "hca_gen_versions.txt", _CTX_HEADER, rows)
+    with pytest.raises(ValueError, match=r"version='0\.5\.10'"):
+        load_generation_dsv4_kind_module_data(path)
+
+    # Two well-formed versions of the same model pool cleanly.
+    good = [
+        _gen_row(attn_kind="hca", cr=128, bs=1, isl=1, step=1023, tp=2, lat=0.5, version="0.5.10"),
+        _gen_row(attn_kind="hca", cr=128, bs=2, isl=1, step=1023, tp=8, lat=0.2, version="0.5.16"),
+    ]
+    path = _write_csv(tmp_path / "hca_gen_versions_ok.txt", _CTX_HEADER, good)
+    data = load_generation_dsv4_kind_module_data(path)
+    q = data[common.KVCacheQuantMode.fp8][common.GEMMQuantMode.fp8_block]
+    assert q[_FLASH_NATIVE_HEADS][32][128][1][1024]["latency"] == pytest.approx(0.5)
+    assert q[_FLASH_NATIVE_HEADS][8][128][2][1024]["latency"] == pytest.approx(0.2)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Shipped-data guardrail: every packaged DSV4 module table is rank-local
+# ───────────────────────────────────────────────────────────────────────
+
+
+def test_shipped_dsv4_module_tables_are_rank_local():
+    """Repo-wide #1429 invariant: every shipped DSV4 module parquet stores
+    rank-LOCAL ``num_heads`` (within one model, ``num_heads * tp_size`` is
+    constant across its tp sweep).  A file regressing to the retired NATIVE
+    convention would poison [native][local] keying for that system, so fail
+    here before it ships.  Uses parquet column reads only — the whole scan is
+    a few dozen small files."""
+    pq = pytest.importorskip("pyarrow.parquet")
+    import aiconfigurator_core
+
+    data_root = Path(aiconfigurator_core.__file__).parent / "systems" / "data"
+    module_files = sorted(
+        p
+        for p in data_root.glob("*/sparse_attention/*/*/dsv4_*_module_perf.parquet")
+        if any(kind in p.name for kind in ("csa_context", "csa_generation", "hca_context", "hca_generation"))
+    )
+    assert module_files, f"no shipped DSV4 module tables found under {data_root}"
+
+    offenders = []
+    for path in module_files:
+        table = pq.read_table(path, columns=["model", "num_heads", "tp_size"])
+        pairs_by_model: dict[str, set[tuple[int, int]]] = {}
+        for model, heads, tp in zip(
+            table["model"].to_pylist(), table["num_heads"].to_pylist(), table["tp_size"].to_pylist(), strict=True
+        ):
+            pairs_by_model.setdefault(str(model), set()).add((int(heads), max(1, int(tp))))
+        for model, pairs in pairs_by_model.items():
+            tps = {tp for _, tp in pairs}
+            heads_constant = len({h for h, _ in pairs}) == 1
+            product_constant = len({h * tp for h, tp in pairs}) == 1
+            if len(tps) > 1 and heads_constant and not product_constant:
+                offenders.append(f"{path.relative_to(data_root)}: {model} {sorted(pairs)}")
+    assert not offenders, "stale NATIVE-semantics DSV4 module rows shipped:\n" + "\n".join(offenders)
+
+
+def test_load_dsv4_kind_module_data_requires_tp_size_column(tmp_path):
+    """A module file with no parseable tp_size column must fail loudly: every
+    row would collapse to tp=1, the stale-NATIVE fingerprint could never
+    trigger, and native = num_heads * tp_size would be silently wrong."""
+    header_no_tp = (
+        "framework,version,device,op_name,kernel_source,model,architecture,"
+        "mla_dtype,kv_cache_dtype,gemm_type,num_heads,batch_size,isl,"
+        "step,compress_ratio,latency"
+    )
+    row = (
+        f"SGLang,test,NVIDIA H20-3e,dsv4_hca_generation_module,"
+        f"compressed_flashmla,{_FLASH_MODEL},DeepseekV4ForCausalLM,"
+        f"bfloat16,fp8_e4m3,fp8_block,64,1,1,1023,128,0.1000"
+    )
+    path = _write_csv(tmp_path / "hca_gen_no_tp.txt", header_no_tp, [row])
+    with pytest.raises(ValueError, match="tp_size"):
+        load_generation_dsv4_kind_module_data(path)
+
+
+# ───────────────────────────────────────────────────────────────────────
+# #1460 review fixes: mixed unparseable tp_size; per-native topk calib
+# ───────────────────────────────────────────────────────────────────────
+
+
+def test_load_dsv4_module_rejects_mixed_unparseable_tp_size(tmp_path):
+    """A row with an empty tp_size among rows that carry one must fail: the
+    silent tp=1 fallback would derive native = num_heads and file the row in a
+    wrong native bucket (#1460 review)."""
+    rows = [
+        _ctx_row(attn_kind="csa", cr=4, bs=1, isl=8192, tp=2, lat=14.0, model=_PRO_MODEL),
+    ]
+    # Same schema, tp_size cell left empty.
+    broken = rows[0].rsplit(",", 3)
+    broken_row = ",".join([broken[0].rsplit(",", 1)[0], "", broken[1], broken[2], broken[3]])
+    path = _write_csv(tmp_path / "csa_ctx_mixed_tp.txt", _CTX_HEADER, rows + [broken_row])
+    with pytest.raises(ValueError, match="without a parseable"):
+        load_context_dsv4_kind_module_data(path)
+
+
+def test_topk_calib_keys_by_native_and_never_borrows(tmp_path):
+    """DELTA calibration nests per native and only the matching identity
+    consumes it — Pro (128) must not borrow Flash (64) deltas (#1460 review)."""
+    from types import SimpleNamespace
+
+    from aiconfigurator.sdk.operations.dsv4 import (
+        _build_topk_calib_from_rows,
+        _dsv4_topk_calib_for_native,
+        _dsv4_topk_delta_ms,
+    )
+
+    by_native = {
+        64: {
+            0: {512: {8: {"v1_flat": {"latency": 0.30}, "v1_top_last": {"latency": 0.18}}}},
+        }
+    }
+    # A malformed (non-int) native key is skipped, matching the Rust
+    # u32_optional row skip (#1460 review) — never a load failure.
+    by_native["garbage"] = by_native[64]
+    calib = _build_topk_calib_from_rows(by_native)
+    assert set(calib.keys()) == {64}
+    db = SimpleNamespace(system="b200_sxm", backend="sglang", version="0.5.14")
+
+    flash = _dsv4_topk_calib_for_native(calib, 64, db)
+    assert flash is not None
+    assert _dsv4_topk_delta_ms(flash.get("v1"), 0, 512, 8) == pytest.approx(0.12)
+
+    pro = _dsv4_topk_calib_for_native(calib, 128, db)
+    assert pro is None  # logged no-op, never a borrowed correction
+    assert _dsv4_topk_delta_ms((pro or {}).get("v1"), 0, 512, 8) == 0.0
+
+    assert _dsv4_topk_calib_for_native(None, 64, db) is None

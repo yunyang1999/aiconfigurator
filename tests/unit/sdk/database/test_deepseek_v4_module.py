@@ -51,6 +51,16 @@ def _deepseek_v4_value(latency: float) -> dict[str, float]:
     return {"latency": latency, "power": 10.0, "energy": latency * 10.0}
 
 
+def _knn_hold(leaves, sol, query, k=4):
+    """Independent reference for the multi-axis past-frontier hold: util from
+    the k nearest leaves in joint log2 space, inverse-distance^2 blend."""
+    logq = [math.log2(max(v, 1e-12)) for v in query]
+    scored = sorted((math.dist([math.log2(max(v, 1e-12)) for v in c], logq), sol(*c) / lat) for c, lat in leaves)[:k]
+    wsum = sum(1.0 / (d * d + 1e-12) for d, _ in scored)
+    util = sum(u / (d * d + 1e-12) for d, u in scored) / wsum
+    return sol(*query) / util
+
+
 def _write_mhc_perf(path, rows: list[str]) -> str:
     header = "framework,version,device,op_name,kernel_source,architecture,num_tokens,hc_mult,hidden_size,latency"
     path.write_text(header + "\n" + "\n".join(rows) + "\n")
@@ -255,10 +265,12 @@ class TestDeepSeekV4AttentionModule:
         assert next_step[1] > current[1]
 
     def test_generation_silicon_below_min_sampled_s_total_holds_boundary_util(self, mutable_comprehensive_perf_db):
-        """b=1, s_total=1 sits below the min sampled s_total=2: the engine holds
-        the boundary util and lets the decode SOL carry the (tiny) difference,
-        instead of the legacy raw-linear downward extrapolation (which halved
-        the latency straight through the launch-overhead floor)."""
+        """b=1, s_total=1 sits below the min sampled s_total=2: the engine
+        holds a util blended from the nearest measured leaves (joint log2
+        distance, so the small-coordinate corner dominates) and lets the
+        decode SOL carry the (tiny) difference, instead of the legacy
+        raw-linear downward extrapolation (which halved the latency straight
+        through the launch-overhead floor)."""
         db = mutable_comprehensive_perf_db
         # SCHEME A silicon data is {head}{cr}{b}{s_total} — no tp level. The shared
         # The shared grid fixture is {tp}{b}{s_total};
@@ -290,7 +302,11 @@ class TestDeepSeekV4AttentionModule:
                 )
             )
 
-        expected = 0.20 * sol(1, 1) / sol(1, 2)  # boundary util held at s_total=2
+        expected = _knn_hold(
+            [((1, 2), 0.20), ((1, 5), 0.50), ((2, 2), 0.40), ((2, 5), 1.00)],
+            sol,
+            (1, 1),
+        )
         assert float(result) == pytest.approx(expected)
         assert result.energy == pytest.approx(expected * 10.0)
 
