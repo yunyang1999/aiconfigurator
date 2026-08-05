@@ -7,9 +7,15 @@ Executes the four-step resolution declared in :mod:`config`:
     1. exact hit            -> return the measured leaf verbatim
     2. resolve in the data  -> Grid: nested bracket+blend (value_transform space)
                                ScatteredSites: site curve eval; unknown site ->
-                               nearest-site transfer in util space
-    3. beyond the range     -> hold the boundary util (k_tail median anchor),
-                               latency = SOL(query) / util
+                               nearest-site transfer in util space (the distance
+                               gate is waived along a single overflowing axis
+                               for a site beyond the scale-up frontier)
+    3. beyond the range     -> hold a boundary util, latency = SOL(query)/util.
+                               Grid (multi-axis): util transferred from the
+                               nn_leaves nearest collected points in joint log2
+                               space (inverse-distance blend, continuous — no
+                               nearest-path snap). Curves/1-D: k_tail median
+                               boundary anchor.
     4. nothing to anchor on -> raise InterpolationDataNotAvailableError
 
 The engine is N-axis: tables are 3 levels (GEMM m/n/k; attention heads/seq/batch)
@@ -143,8 +149,9 @@ _SITE_INDEX_CACHE_MAX = 32
 
 
 def clear_caches() -> None:
-    """Drop engine-internal caches (site indexes). Op ``clear_cache()`` calls this."""
+    """Drop engine-internal caches (site/leaf indexes). Op ``clear_cache()`` calls this."""
     _SITE_INDEX_CACHE.clear()
+    _GRID_LEAF_CACHE.clear()
 
 
 def _walk_leaves(node, depth: int, n_axes: int, prefix: list, out: list) -> None:
@@ -252,6 +259,43 @@ def _eval_curve(cfg: OpInterpConfig, curve: list, q, n_axes, curve_pos, site_pos
     return lat, power
 
 
+def _frontier_waiver_anchors(site_keys, candidates, site_key, q_log, site_logs, max_site_distance):
+    """Anchor indices for a scale-up frontier query, or None (gate miss stands).
+
+    The distance gate is waived ONLY for the intended frontier overflow, and
+    everything is computed over ``candidates`` (the coverage-eligible sites) so
+    admissibility and the anchors actually used cannot diverge:
+
+    - exactly ONE site axis overflows (strictly above the candidates' maximum).
+      Simultaneous multi-axis overflow means the table is a sparse stub for
+      this shape (e.g. an fp8_block table collected at n,k<=128 queried with a
+      real logits GEMM) — holding a launch-bound stub's util across many
+      octaves fabricates arbitrarily wrong latencies, so it stays a miss;
+    - no axis sits below the candidates' minimum (scale-down never transfers);
+    - the NON-overflow axes still pass the 2-octave gate (residual log2
+      distance), so anchors are genuine frontier neighbours of the query and
+      the transfer is scale-up along the overflow axis only.
+
+    On the overflow axis every anchor is below the query by construction; the
+    caller's inverse-distance weighting then favours the largest collected
+    sites, and SOL(query) carries the growth (the same trust as the m curve
+    axis and the Grid out-of-range hold)."""
+    axes = range(len(site_key))
+    cand_keys = [site_keys[i] for i in candidates]
+    overflow = [a for a in axes if site_key[a] > max(k[a] for k in cand_keys)]
+    if len(overflow) != 1:
+        return None
+    if any(site_key[a] < min(k[a] for k in cand_keys) for a in axes):
+        return None
+    resid = [a for a in axes if a not in overflow]
+
+    def resid_dist(i: int) -> float:
+        return math.sqrt(sum((site_logs[i][a] - q_log[a]) ** 2 for a in resid))
+
+    admissible = [i for i in candidates if resid_dist(i) <= max_site_distance]
+    return admissible or None
+
+
 def _resolve_scattered(cfg: OpInterpConfig, data: dict, coords):
     sites, site_keys, site_logs, curve_pos, site_pos, n_axes = _site_index(cfg, data)
     res = cfg.resolver
@@ -277,9 +321,18 @@ def _resolve_scattered(cfg: OpInterpConfig, data: dict, coords):
 
     ranked = sorted(candidates, key=dist)
     if res.max_site_distance is not None:
-        ranked = [i for i in ranked if dist(i) <= res.max_site_distance]
-        if not ranked:
-            raise _miss(cfg, coords, "no site within max_site_distance")
+        gated = [i for i in ranked if dist(i) <= res.max_site_distance]
+        if not gated:
+            # Beyond the scale-up frontier the gate is waived for the overflow
+            # axis only: anchors are the coverage-eligible sites that still
+            # pass the gate on the remaining axes, and SOL(query) carries the
+            # growth (frontier-holdout LOO: median vs IDW anchoring measured
+            # equivalent, so the ordinary transfer below serves).
+            gated = _frontier_waiver_anchors(site_keys, candidates, site_key, q_log, site_logs, res.max_site_distance)
+            if gated is None:
+                raise _miss(cfg, coords, "no site within max_site_distance")
+            gated.sort(key=dist)
+        ranked = gated
 
     wsum = u_acc = p_acc = 0.0
     for i in ranked[: res.nn_sites]:
@@ -373,37 +426,109 @@ def _grid_interior(cfg: OpInterpConfig, node, coords, depth: int):
     return lat, p_lo + (p_hi - p_lo) * w
 
 
+# Bounded LRU of per-table leaf indexes for the multi-axis hold path, same
+# contract as _SITE_INDEX_CACHE: tables are immutable after load; the index
+# stores only structure (coords, latency, power, log2 coords), never sol_fn
+# values (op layers build a fresh sol_fn closure per query).
+_GRID_LEAF_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
+_GRID_LEAF_CACHE_MAX = 32
+
+
+def _grid_leaf_index(cfg: OpInterpConfig, data: dict):
+    key = (id(data), cfg.axes)
+    cached = _GRID_LEAF_CACHE.get(key)
+    if cached is not None and cached[0] is data:
+        _GRID_LEAF_CACHE.move_to_end(key)
+        return cached[1]
+
+    leaves: list = []
+    _walk_leaves(data, 0, len(cfg.axes), [], leaves)
+    index = [(c, tuple(math.log2(max(v, 1e-12)) for v in c), _leaf_lat(leaf), _leaf_power(leaf)) for c, leaf in leaves]
+    _GRID_LEAF_CACHE[key] = (data, index)
+    if len(_GRID_LEAF_CACHE) > _GRID_LEAF_CACHE_MAX:
+        _GRID_LEAF_CACHE.popitem(last=False)
+    return index
+
+
 def _grid_hold(cfg: OpInterpConfig, data: dict, coords):
-    """Anchor past-the-frontier queries: snap to the nearest collected path,
-    hold the boundary util (k_tail median along the innermost axis), and let
-    SOL(query) carry the growth."""
-    node = data
-    snapped = []
-    for depth in range(len(cfg.axes) - 1):
-        if not node:
-            raise _miss(cfg, coords, f"empty branch at axis {cfg.axes[depth]!r}")
-        c = coords[depth]
-        key = c if c in node else min(node.keys(), key=lambda k: abs(k - c))
-        snapped.append(key)
-        node = node[key]
+    """Anchor past-the-frontier queries: transfer util from the ``nn_leaves``
+    nearest collected points in joint log2 space (inverse-distance^2 blend, the
+    same transfer ScatteredSites uses between sites); latency = SOL(query)/util.
+
+    This replaces the earlier nearest-path snap, which was discontinuous at
+    outer-axis midpoints (a +36.9% cliff between batch 192 and 193 on the B200
+    generation-attention staircase, where the snap flips from the b=128 row to
+    the b=256 row) and could anchor on a frontier point in a different
+    efficiency regime (an unsaturated short row end). Frontier-holdout LOO on
+    11 real tables: deep-tail p90 59%->11% (b200 gen-attn), max 100%->25%
+    (b200 ctx-attn); joint-log kNN is also axis-order independent, so the
+    generation ([n][b][s]) and context ([n][s][b]) nestings behave the same.
+
+    Single-axis tables keep the k_tail-median boundary hold (a 1-D curve end
+    IS the nearest anchor; the median is the established sawtooth guard).
+    """
+    if len(cfg.axes) == 1:
+        return _grid_hold_1d(cfg, data, coords)
+
+    index = _grid_leaf_index(cfg, data)
+    if not index:
+        raise _miss(cfg, coords, f"empty branch at axis {cfg.axes[0]!r}")
+    q_log = tuple(math.log2(max(v, 1e-12)) for v in coords)
+    # Exact distance ties are real on power-of-two grids (symmetric +-1-octave
+    # neighbours land at identical joint-log distance); break them by leaf
+    # coordinates so selection is deterministic, independent of table
+    # insertion order, and identical to the Rust port's BTreeMap walk.
+    ranked = sorted(index, key=lambda item: (math.dist(item[1], q_log), item[0]))
+
+    wsum = u_acc = p_acc = 0.0
+    picked = 0
+    nearest = None
+    for c, c_log, lat, power in ranked:
+        if picked >= cfg.resolver.nn_leaves:
+            break
+        sol = cfg.sol_fn(*c)
+        if not (math.isfinite(lat) and lat > 0 and math.isfinite(sol) and sol > 0):
+            continue
+        d = math.dist(c_log, q_log)
+        w = 1.0 / (d * d + 1e-12)
+        wsum += w
+        u_acc += w * (sol / lat)
+        p_acc += w * power
+        picked += 1
+        if nearest is None:
+            nearest = (c, d)
+    if wsum <= 0:
+        raise _miss(cfg, coords, "no positive-util boundary anchor")
+    sol_q = cfg.sol_fn(*coords)
+    if sol_q <= 0:
+        raise _miss(cfg, coords, "non-positive SOL at query")
+    anchor_util = u_acc / wsum
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "perf_interp util-hold (grid kNN): coords=%s nearest=%s log_distance=%.2f anchor_util=%.4g k=%d",
+            dict(zip(cfg.axes, coords, strict=True)),
+            nearest[0],
+            nearest[1],
+            anchor_util,
+            picked,
+        )
+    return sol_q / anchor_util, p_acc / wsum
+
+
+def _grid_hold_1d(cfg: OpInterpConfig, node: dict, coords):
+    """1-D curve past the sweep end: hold the k_tail-median boundary util."""
     if not node:
         raise _miss(cfg, coords, f"empty branch at axis {cfg.axes[-1]!r}")
-
     keys = sorted(node)
     c = coords[-1]
     k_tail = cfg.resolver.k_tail
-    if c > keys[-1]:
-        tail = keys[-k_tail:]
-    elif c < keys[0]:
-        tail = keys[:k_tail]
-    else:  # innermost is in range; an OUTER axis was snapped
-        tail = [min(keys, key=lambda k: abs(k - c))]
+    tail = keys[-k_tail:] if c > keys[-1] else keys[:k_tail]
 
     utils, powers = [], []
     for t in tail:
         leaf = node[t]
         lat = _leaf_lat(leaf)
-        sol = cfg.sol_fn(*snapped, t)
+        sol = cfg.sol_fn(t)
         if lat > 0 and sol > 0:
             utils.append(sol / lat)
             powers.append(_leaf_power(leaf))
@@ -414,13 +539,11 @@ def _grid_hold(cfg: OpInterpConfig, data: dict, coords):
         raise _miss(cfg, coords, "non-positive SOL at query")
     anchor_util = statistics.median(utils)
     if logger.isEnabledFor(logging.DEBUG):
-        c_last = coords[-1]
-        edge = keys[-1] if c_last > keys[-1] else keys[0]
+        edge = keys[-1] if c > keys[-1] else keys[0]
         logger.debug(
-            "perf_interp util-hold (grid): coords=%s snapped=%s anchor_util=%.4g inner_distance=%.2fx",
+            "perf_interp util-hold (curve 1d): coords=%s anchor_util=%.4g distance=%.2fx",
             dict(zip(cfg.axes, coords, strict=True)),
-            snapped,
             anchor_util,
-            (c_last / edge) if edge else float("inf"),
+            (c / edge) if edge else float("inf"),
         )
     return sol_q / anchor_util, statistics.median(powers)
