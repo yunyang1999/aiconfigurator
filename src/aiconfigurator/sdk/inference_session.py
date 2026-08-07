@@ -1198,6 +1198,17 @@ class AFDInferenceSession:
         t_c = t_a2f + t_f2a
         if cfg.pipeline_model == "serial":
             return t_a + t_a2f + t_f + t_f2a, False
+        if num_microbatches < 2:
+            # A single in-flight microbatch cannot overlap anything: layer i+1's
+            # A input IS layer i's F output, so the two pools strictly alternate
+            # and neither has work to fill the other's gap. Both K=3 and K=2
+            # declare N_min >= 2 above; only the optimistic branch enforced its
+            # own threshold, and its fallback landed on conservative, which needs
+            # two in-flight microbatches as well. Without this the K=2 cadence is
+            # handed to a configuration that cannot sustain it -- on MiniMax-M3
+            # 4A4F batch 16 that is 11.4 ms against the 20.0 ms the same inputs
+            # give under `serial`.
+            return t_a + t_a2f + t_f + t_f2a, False
         if cfg.pipeline_model == "optimistic":
             # Need ≥ 2 + t_c / max(t_a, t_f) in-flight microbatches to
             # hide the network stage behind compute.  Equivalent to the
