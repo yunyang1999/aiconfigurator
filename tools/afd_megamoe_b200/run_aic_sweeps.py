@@ -112,7 +112,7 @@ def run_one(cfg: dict) -> dict:
         "--a-tp-size", "1", "--a-batch-size", str(cfg["batch"]),
         "--num-microbatches", str(cfg["mb_pipeline"]),
         "--f-moe-ep-size", str(cfg["f"]),
-        "--pipeline-model", cfg.get("pipeline", "optimistic"),
+        "--pipeline-model", cfg.get("pipeline", "conservative"),
         "--afd-moe-time-ms", f"{cfg['moe_ms']:.6f}", "--no-color",
     ]
     accepted = NEXTN_ACCEPTED.get(cfg["mtp"])
@@ -120,7 +120,7 @@ def run_one(cfg: dict) -> dict:
         cmd += ["--nextn-accepted", str(accepted)]
     row = {k: cfg[k] for k in ("sweep", "model", "a", "f", "batch", "mtp",
                                "mb_measured", "mb_pipeline", "isl", "osl")}
-    row["pipeline"] = cfg.get("pipeline", "optimistic")
+    row["pipeline"] = cfg.get("pipeline", "conservative")
     row["moe_ms_measured"] = round(cfg["moe_ms"], 6)
     row["database_mode"] = DATABASE_MODE.get(cfg["model"], "SILICON")
     try:

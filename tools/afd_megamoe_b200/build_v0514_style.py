@@ -364,6 +364,22 @@ def sheet_config(wb, cells, counts):
          "static_gen reports op latencies CUMULATIVE over the generation phase, so they are "
          "divided by (osl - 1). Verified: the cumulative sum over (osl-1) reproduces its own "
          "TPOT exactly."),
+        ("AFD pipeline model",
+         "conservative, and microbatches are capped at what the pipeline can sustain. AIC's "
+         "K=3 (optimistic) and K=2 (conservative) cadences declare N_min of 3 and 2 in-flight "
+         "microbatches, but only the optimistic branch enforced its threshold, and its "
+         "fallback landed on conservative -- which needs two as well. A single in-flight "
+         "microbatch cannot overlap anything: layer i+1's A input IS layer i's F output, so "
+         "the pools strictly alternate. mb=1 is therefore priced serially "
+         "(t_a + t_a2f + t_f + t_f2a per layer) rather than at max(t_a, t_f). On MiniMax-M3 "
+         "4A4F batch 16 that is 20.0 ms instead of 11.4 ms. mb>=2 is untouched. "
+         "PENDING CONFIRMATION with the PR #1323 authors: the missing N_min check may be an "
+         "omission or an intentional fine-grained-overlap assumption."),
+        ("Why conservative and not optimistic",
+         "With the measured stage injected, t_a2f = t_f2a = 0, so max(t_a, t_f, t_c) and "
+         "max(t_a + t_a2f, t_f + t_f2a) are numerically identical -- verified to the digit. "
+         "Conservative is the weaker claim: nothing here demonstrates three in-flight "
+         "microbatches hiding a network stage."),
         ("Capacity check",
          "Enforced here, not by AIC. static_gen runs no OOM check of its own -- isl=131072 at "
          "batch 64 returns a result reporting 782.89 GiB on a 180 GiB card -- so a row is "

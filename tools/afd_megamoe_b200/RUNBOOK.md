@@ -173,7 +173,69 @@ Four flags that are not optional:
 | `--systems-paths default,aic_systems` + `b200_sxm_subnode` | `b200_sxm` declares 8 GPUs/node so a sub-node split like 6A2F cannot be expressed. The custom system sets 1 GPU per AIC-node and raises `inter_node_bw` to the NVLink figure, which is what those links physically are inside one node. **Valid only while total GPUs ≤ 8** |
 
 Capture stderr: AIC raises OOM as a traceback there, and OOM is a real outcome
-(the sheet calls it `batch_limited_by=capacity`), not a tooling failure.
+(the sheet calls it `batch_limited_by=capacity`), not a tooling failure. It also
+carries the pipeline-degradation warning described next, which is easy to miss
+if only OOM is matched.
+
+## 2.1 Pipeline model, and the mb=1 correction
+
+Run `--pipeline-model conservative`. With the measured stage injected
+`t_a2f = t_f2a = 0`, so `max(t_a, t_f, t_c)` and `max(t_a + t_a2f, t_f + t_f2a)`
+are numerically identical — verified to the digit. Conservative is the weaker
+claim: nothing in this setup demonstrates three in-flight microbatches hiding a
+network stage, so do not assert it.
+
+`pipeline_model` and `num_microbatches` are **independent knobs**, and mb=1/2/3
+do **not** map to serial/conservative/optimistic. mb affects `t_cycle` in exactly
+one place — the optimistic branch's `min_m` gate — and otherwise only scales the
+slot count in
+`t_global_step = pipeline_fill + t_cycle × (mb × layers − 1)`.
+
+That formula makes more microbatches **worse**, not better, once `t_a` becomes
+the binding stage. Holding everything else fixed on MiniMax-M3 4A4F batch 16:
+
+| mb | T_a/layer | T_f/layer | TPOT | concurrency |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 145 µs | 188 µs | 11.4 ms | 64 |
+| 2 | 136 | 94 | 16.4 | 64 |
+| 4 | 124 | 47 | 29.8 | 64 |
+
+`t_f` is the injected time divided by mb, so it shrinks; the slot count grows
+proportionally; and once `t_a > t_f` the cadence is pinned at `t_a` while the
+slots keep multiplying. On top of that the *measured* mb=2 stage is not half the
+mb=1 one — MegaMoE re-streams the expert shard per lane, so Qwen3 4A4F at 384
+tokens measures 10.145 ms at mb=1 and **16.765 ms** at mb=2.
+
+**The correction.** AIC's K=3 and K=2 cadences declare `N_min` of 3 and 2
+in-flight microbatches, but only the optimistic branch enforced its threshold —
+and its fallback landed on conservative, which needs two as well. A single
+in-flight microbatch cannot overlap anything: layer i+1's A input **is** layer
+i's F output, so the pools strictly alternate with nothing to fill the gaps.
+This branch was added to `_pipeline_tcycle`, before the optimistic and
+conservative branches:
+
+```python
+if num_microbatches < 2:
+    return t_a + t_a2f + t_f + t_f2a, False
+```
+
+Only mb=1 changes; mb≥2 reproduces bit-for-bit. On the M3 config above, mb=1
+goes from 11.4 ms to 20.0 ms.
+
+It moved the headline: the no-latency-limit ratio went from **1.000 (AFD ahead
+30/60)** to **0.751 (AFD ahead 0/60)**, and `AFD_Perf_Gain > 10%` from 143 rows
+to 26.
+
+**This is pending confirmation with the PR #1323 authors** — the missing `N_min`
+check may be an omission or an intentional fine-grained-overlap assumption. The
+pre-correction sweep is kept at
+`handoff/aic_afd_sweeps_optimistic_mb1max.csv.bak` for comparison.
+
+Note what did *not* happen: the optimiser still picks mb=1 in 400 of 739 rows
+after the correction (was 442). Making mb=1 1.75x more expensive did not push it
+to mb=2, because mb=2 is worse for a different reason. AFD has no cheap overlap
+available on this hardware — mb=1 gets none, mb=2 gets some but pays 65% more
+MoE for it.
 
 ---
 
@@ -343,11 +405,11 @@ identical.
 the cost model must re-run the configuration search, not scale the old winner —
 31% of rows change winning configuration.
 
-**mb=1 is not "unoverlapped".** The steady-state AFD cadence is
-`max(t_a, t_f)`; only the one-off pipeline fill is a sum, paid once out of 94
-layers. `pipeline_model="serial"` is the only setting that actually removes the
-overlap, and it is reachable only through the API — the CLI's argparse `choices`
-does not list it.
+**mb=1 was silently given an overlap it cannot sustain.** See §2.1. The
+pipeline is across MICROBATCHES, not across layers — `min_m` in the source is
+literally counted in "in-flight microbatches". An earlier reading of this as a
+cross-layer pipeline was wrong, and wrong in the direction that flatters AFD by
+1.75x on the affected rows.
 
 **Microbatching is net negative on this hardware.** Qwen3 4A4F, 384 tokens:
 mb=1 gives 10.145 ms injected / 3166 tok/s/GPU; mb=2 gives 16.765 ms / 1986.
