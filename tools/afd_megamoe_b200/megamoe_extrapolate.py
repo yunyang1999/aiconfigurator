@@ -257,7 +257,8 @@ class MegaMoEExtrapolator:
 
     def predict(self, shape: Shape, stage: str, a_gpus: int, f_gpus: int,
                 seq_per_source_rank: int, microbatches: int, mtp_nextn: int,
-                moe_layers: int | None = None) -> dict:
+                moe_layers: int | None = None,
+                domain_size: int = GPUS_PER_NVLINK_DOMAIN) -> dict:
         """Return the AIC `afd_moe_time_ms` (full resident batch, all layers,
         all microbatches) plus provenance."""
         layers = moe_layers if moe_layers is not None else shape.moe_layers
@@ -283,9 +284,13 @@ class MegaMoEExtrapolator:
         if seq_per_source_rank / microbatches < MIN_SEQ_PER_LANE:
             tags.append("below-batch-floor")
         domain_gpus = f_gpus if stage == "agg" else a_gpus + f_gpus
-        if domain_gpus > GPUS_PER_NVLINK_DOMAIN:
+        if domain_gpus > domain_size:
             tags.append("cross-node")
-        elif f_gpus not in env["f_gpus"]:
+        # NOT elif. An unmeasured F-pool size is a separate claim from crossing
+        # the NVLink domain, and on a rack-scale domain the first can be true
+        # while the second is false. Chaining them hid "F=8 was never measured"
+        # behind "this exceeds 8 GPUs" for every large split.
+        if f_gpus not in env["f_gpus"]:
             tags.append("f-pool")
         prov = "interpolated" if not tags else "extrapolated:" + "+".join(tags)
         return {

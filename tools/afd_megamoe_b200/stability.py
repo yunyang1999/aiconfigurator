@@ -41,10 +41,21 @@ from __future__ import annotations
 
 CV_LIMIT = 4.0
 FASTAFD_CV_LIMIT = 3.0     # what `stable` in the JSON means
+# The campaign's measurement protocol. Anything shorter is a plumbing check, not
+# a measurement, and a low CV does not redeem it: the multimodel smoke suite runs
+# warmups=2 / iterations=10 and reported 0.190 ms for a Qwen3 point that measures
+# 6.919 ms under the real protocol -- 36x off, with cv=3.55% that sails through
+# the dispersion gate. A cold kernel is reproducibly cold.
+MIN_WARMUPS = 30
+MIN_ITERATIONS = 40
 
 
 def accept(payload: dict, cv_limit: float = CV_LIMIT) -> bool:
     """True if a benchmark JSON is usable at this study's dispersion limit."""
+    if (payload.get("warmups") or 0) < MIN_WARMUPS:
+        return False
+    if (payload.get("iterations") or 0) < MIN_ITERATIONS:
+        return False
     finite = payload.get("all_outputs_finite_by_rank")
     if finite is not None and not all(finite):
         return False
