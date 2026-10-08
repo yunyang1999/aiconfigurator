@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""GB200 NVL72 sweep with the measured MegaMoE stage injected into both arms.
+"""GB200 NVL72 sweep with the REAL lyris-measured MegaMoE stage injected into
+both arms. Not a B200 + g(ag) projection -- see megamoe_table.py's REAL_SPLITS
+for why this data needs no extrapolation for the configs it covers.
 
 F side measured, A side AIC. That split is exact in AIC: the AFD path sums
 `a_partition.attn_ops` for the A side and replaces `f_partition.ffn_ops` wholesale
@@ -12,56 +14,91 @@ AIC's generic MoE model would not be a comparison of deployments.
 
 The grid is chosen so the injected value is always a real measurement:
 
-    AFD          F in {1, 2, 4}   -> shards 128/64/32 (Qwen3, M3), 256/128/64 (M2.5)
-                 batch on the measured seq rungs
-                 A and a_tp free; the A pool enters only through g(A/a_tp)
-    colocated    EP in {1, 2, 4, 8}, all measured and all dividing 72 exactly
+    AFD          (A, F) PAIRED as one deployment split per F, exactly as
+                 measured on lyris: 68A4F/64A8F/56A16F/40A32F for four of the
+                 five models, and 64A8F/60A12F/56A16F/48A24F for
+                 deepseek_v4_pro (68A4F does not fit its HBM budget).
+                 a_tp over {1, 2, 4}, but ONLY where the resulting dispatcher
+                 count ag = A/tp was itself measured -- see REAL_AGS in
+                 megamoe_table.py. There is no g(ag) scaling any more: ag is
+                 part of the lookup key, and an unmeasured ag is dropped rather
+                 than priced from a neighbouring one. batch on the measured
+                 seq rungs.
+    colocated    EP at whatever lyris actually measured per model (1/2/4/8 for
+                 qwen3_235b/minimax_m25; 2/4/8 for minimax_m3/deepseek_v4_flash
+                 and deepseek_v4_pro's own 4/8/24 -- EP=1 crashes FastAFD's
+                 MegaMoE kernel for those three models, a real kernel
+                 limitation, not a gap in this sweep)
                  tokens per expert rank = batch / tp, on the measured rungs
 
-F >= 8 is deliberately absent: it needs shard 16, which only the colocated kernel
-has run, and the two kernels differ by a median 4.2% and up to 43% at matched
-(shard, tokens per rank). That is too loose to stand in for a measurement, so
-that region is left empty rather than modelled.
+F now reaches 16 and 32 (24 for deepseek_v4_pro) because the split kernel was
+measured directly at those shards on lyris -- the old B200-projection tool
+capped F at {1, 2, 4} because only the colocated kernel had ever run wider
+shards there, which was too loose to stand in for a measurement.
 
 Both arms sweep attention tensor parallelism over {1, 2, 4}. Sharding attention
 is what buys latency headroom under a tight limit, so giving it to one arm only
-would decide the comparison by construction. The cap is 4 on both sides because
-AIC requires tp to divide gpus_per_node and expresses AFD pools in node units, so
-a_tp = 8 would force F to be a multiple of 8 -- outside the measured shards.
+would decide the comparison by construction.
 
-Every AFD row is computed twice: once with the fitted g(ag) and once with g == 1,
-which is the most AFD-favourable choice available. Any conclusion that holds at
-both ends does not rest on the one extrapolated term.
+Every AFD row's `moe_ms` and `moe_ms_g1` are identical: with ag in the key
+there is no extrapolated term left to switch off. The two columns are kept so
+downstream tooling built for the B200 projection's sensitivity check still runs.
+
+68A4F has NO tp>1 support, and that is a measurement gap rather than a choice:
+FastAFD's launcher requires nnodes*4 == world_size, so ag=34 (38 GPUs) and
+ag=17 (21 GPUs) at F=4 cannot be benchmarked at all. Those rows come back
+`illegal`.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from afd_paths import data_root
 
-ROOT = Path("/home/scratch.yuny_wwfo_1/megamoe")
-AIC = Path("/home/scratch.yuny_wwfo_1/aic/aic-yy")
+# Data root: the unpacked data bundle, from AFD_MEGAMOE_ROOT (required).
+ROOT = data_root()
+# Repository root, derived rather than hard-coded so a fresh checkout runs
+# from wherever it was cloned.
+AIC = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-SYSPATHS = f"default,{ROOT}/aic_systems"
+TOOLDIR = Path(__file__).resolve().parent
+# gb200_g{1,2,4,8}.yaml live next to this script, not in a ROOT/aic_systems dir
+# -- that path is a leftover from the old B200-projection tool and does not
+# exist on lyris.
+# Overlay first. It mirrors the shipped systems tree with symlinks and replaces
+# exactly one file: the DeepSeek-V4 MoE table, with measured EP=24 rows added.
+# Every moe_ep_size AIC ships is a power of two, so EP=24 could not be priced
+# for any model and DSV4-Pro's colocated arm rested on EP=8 alone.
+# The systems ROOT, not its data/ subdirectory: "default" resolves to
+# .../aiconfigurator_core/systems and the loader appends data/ itself. Pointing
+# one level too deep resolved cleanly and silently found nothing.
+OVERLAY = str(ROOT / "aic_overlay")
+SYSPATHS = f"{OVERLAY},default,{TOOLDIR}"
 DOMAIN = 72
 CAPACITY_GIB = 198674743296 / 1024 ** 3     # gb200.yaml mem_capacity, 185.02 GiB
 GIB = 1024 ** 3
 
 MODEL_PATH = {"qwen3_235b_fp4": "Qwen/Qwen3-235B-A22B-FP8",
               "minimax_m25_fp4": "MiniMaxAI/MiniMax-M2.5",
-              "minimax_m3_fp4": "MiniMaxAI/MiniMax-M3"}
+              "minimax_m3_fp4": "MiniMaxAI/MiniMax-M3",
+              "deepseek_v4_flash_fp4": "deepseek-ai/DeepSeek-V4-Flash",
+              "deepseek_v4_pro_fp4": "deepseek-ai/DeepSeek-V4-Pro"}
 DB_MODE = {"minimax_m3_fp4": "HYBRID"}
 NEXTN_ACCEPTED = {0: None, 1: 0.85, 2: 1.53}
 
-F_VALUES = (1, 2, 4)
-A_LADDER = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 32,
-            36, 40, 44, 48, 52, 56, 60, 64, 66, 68, 70, 71)
+# A is not swept independently: real lyris data measured one (A, F) split per F.
+# Attention TP then divides it -- tp=k means k A-GPUs dispatch once, so the
+# physical condition is ag = A/k -- and REAL_AGS in megamoe_table.py is the
+# single source of truth for which of those are measured. F reaches 16 and 32
+# (24 for deepseek_v4_pro), which the old B200-projection F_VALUES=(1,2,4) cap
+# excluded because only the colocated kernel had ever run those shards there.
 TP = (1, 2, 4)
-COLO_EP = (1, 2, 4, 8)
 # v0514's grid. nextN 1 and 2 carry full measured coverage -- same shards, same
 # 14 batch rungs, same colocated EPs as nextN 0 -- so they cost nothing but AIC
 # time. isl and osl are pure AIC dimensions: the injected MoE stage does not
@@ -77,19 +114,77 @@ OSLS_BY_MTP = {0: (256, 1024, 4096), 1: (1024,), 2: (1024,)}
 # 1.79x on the stage itself, because each lane re-streams the expert weights and
 # MegaMoE is weight-bound. Which way that trade lands depends on the balance:
 # where attention dominates (long context, wide A pool) mb=2 wins outright, and
-# on Qwen3 at isl=131072 it takes the AFD arm from parity to 1.14x. Both counts
-# are measured, so both are swept and each cell keeps whichever is better.
-MBS = (1, 2)
+# on Qwen3 at isl=131072 it takes the AFD arm from parity to 1.14x. lyris also
+# measured mb=4 (further overlap, further weight-restream cost); all three
+# counts are measured, so all three are swept and each cell keeps whichever
+# is best.
+MBS = (1, 2, 4)
 
 _T = None
 _EST = None
+
+
+# Recorded routing distributions, one per model, keyed as the sweep keys models.
+# Only what a real router on real prompts actually produced goes in here; a model
+# with no recording is simply absent, and its stage times stay balanced-only and
+# are marked as such in the output rather than corrected from a neighbour's shape.
+# The coefficient is proportional to the skew, so borrowing another model's
+# distribution would move the answer by the full difference in skew.
+#
+# PER LAYER. The distributions below keep counts_per_layer, and the imbalance
+# is averaged over layers rather than computed on the layer-sum. A decode step
+# waits for each layer's own busiest rank, and that rank moves nearly every
+# layer, so summing the layers first cancels the skew away: on the recorded
+# Qwen3 routing the layer-summed max/mean is 1.31 at 32 ranks where the
+# per-layer figure is 2.90. Set AFD_ROUTING_AGGREGATED=1 to reproduce the
+# earlier layer-summed numbers for comparison.
+AGGREGATED = os.environ.get("AFD_ROUTING_AGGREGATED") == "1"
+
+ROUTING_DIST = {
+    # Recorded from a real router on real prompts, 94 layers kept separate.
+    "qwen3_235b_fp4": ROOT / "real_routing_qwen3_235b_perlayer.json",
+    # Synthetic: 94 independent layers, each drawn lognormal at the per-layer CV
+    # Qwen3's real router produced (136%). These four models' own routing has
+    # not been recorded -- minisgl implements none of their architectures except
+    # MiniMax-M2's, and that capture has not yet completed. Without an entry
+    # here the correction bails before it reaches the MEASURED coefficient, so
+    # their rows would carry the uniform-routing time. Stating the assumed skew
+    # is more informative than that.
+    "minimax_m25_fp4": ROOT / "synthetic_perlayer_256.json",
+    "minimax_m3_fp4": ROOT / "synthetic_perlayer_128.json",
+    "deepseek_v4_flash_fp4": ROOT / "synthetic_perlayer_256.json",
+    "deepseek_v4_pro_fp4": ROOT / "synthetic_perlayer_384.json",
+}
+ROUTING_DIST_AGGREGATED = {
+    "qwen3_235b_fp4": ROOT / "real_routing_qwen3_235b.json",
+    "minimax_m25_fp4": ROOT / "synthetic_cvmeasured_256.json",
+    "minimax_m3_fp4": ROOT / "synthetic_cvmeasured_128.json",
+    "deepseek_v4_flash_fp4": ROOT / "synthetic_cvmeasured_256.json",
+    "deepseek_v4_pro_fp4": ROOT / "synthetic_cvmeasured_384.json",
+}
+# Which models' skew is recorded rather than assumed; the workbook says so.
+ROUTING_IS_REAL = {"qwen3_235b_fp4"}
+
+
+def _routing_distributions():
+    src = ROUTING_DIST_AGGREGATED if AGGREGATED else ROUTING_DIST
+    key = "counts_total" if AGGREGATED else "counts_per_layer"
+    out = {}
+    for model, path in src.items():
+        try:
+            out[model] = json.loads(Path(path).read_text())[key]
+        except (OSError, KeyError, ValueError):
+            continue
+    return out
 
 
 def table():
     global _T
     if _T is None:
         from megamoe_table import MeasuredStage
-        _T = MeasuredStage(ROOT)
+        _T = MeasuredStage(ROOT, imbalance_dist=_routing_distributions(),
+                           imbalance_measured=ROOT / "measured_imbalance_coefficients.json",
+                           real_skew=ROUTING_IS_REAL)
     return _T
 
 
@@ -146,12 +241,13 @@ def run_afd(cfg):
     if ms is None:
         row["status"] = "illegal"
         return row
-    ms1 = T.afd_ungained(model, fq, cfg["batch"], cfg["mtp"], mb)
+    ms1 = T.afd_ungained(model, fq, cfg["batch"], cfg["mtp"], mb, a_gpus=a, a_tp=tp)
     row["moe_ms"] = round(ms, 6)
     row["moe_ms_g1"] = round(ms1, 6)
     row["ag_effective"] = a / tp
     row["base_spread_pct"] = round(
-        T.base_spread.get((model, cfg["mtp"], mb, T.experts[model] // fq, cfg["batch"]), 0.0), 2)
+        T.base_spread.get((model, cfg["mtp"], mb, T.experts[model] // fq, cfg["batch"],
+                           a // tp), 0.0), 2)
     try:
         r = _afd_once(model, a, fq, tp, g, cfg["batch"], cfg["isl"], cfg["osl"], cfg["mtp"], ms, mb)
     except Exception as e:
@@ -288,6 +384,7 @@ def dispatch(c):
 
 def build_configs():
     T = table()
+    from megamoe_table import REAL_AGS, REAL_SPLITS
     cfgs, seen = [], set()
     for mtp in MTPS:
       env = T.envelope(mtp)
@@ -299,35 +396,39 @@ def build_configs():
         ne = T.experts[model]
         for isl in ISLS:
             for batch in e["seqs"]:
-                for fq in F_VALUES:
+                for fq, a in sorted(REAL_SPLITS.get(model, {}).items()):
                     if ne % fq or ne // fq not in e["shards"]:
                         continue
+                    assert a + fq == DOMAIN, f"{model} F={fq}: split {a}+{fq} != {DOMAIN}"
+                    measured_ags = set(e.get("ags", {}).get(ne // fq, ()))
                     for g in (1, 2, 4):
-                        if fq % g:
+                        if fq % g or a % g:
                             continue
                         for tp in TP:
-                            if g % tp:
+                            if g % tp or a % tp:
                                 continue
-                            for a in A_LADDER:
-                                if a % g or a % tp or a + fq > DOMAIN:
+                            # ag = A/tp must itself be a measured condition; an
+                            # unmeasured ag is dropped, never priced from another
+                            if a // tp not in measured_ags:
+                                continue
+                            # a is the real measured split for this (model, fq),
+                            # fixed rather than swept -- see module docstring and
+                            # REAL_SPLITS in megamoe_table.py. g only gates which
+                            # tp is reachable; the four granularity files agree
+                            # to the digit elsewhere, so one run per distinct
+                            # (a, f, tp) is enough.
+                            for mb in MBS:
+                                if (ne // fq, batch, a // tp) not in e[f"mb{mb}"]:
                                     continue
-                                # g only gates which tp is reachable; the four
-                                # granularity files agree to the digit elsewhere,
-                                # so one run per distinct (a, f, tp) is enough.
-                                for mb in MBS:
-                                    if (ne // fq, batch) not in e[f"mb{mb}"]:
-                                        continue
-                                    key = (model, mtp, osl, isl, batch, a, fq, tp, mb)
-                                    if key in seen:
-                                        continue
-                                    seen.add(key)
-                                    cfgs.append(dict(kind="afd", model=model, a=a, f=fq,
-                                                     batch=batch, mtp=mtp, isl=isl,
-                                                     osl=osl, a_tp=tp, gran=g, mb=mb))
+                                key = (model, mtp, osl, isl, batch, a, fq, tp, mb)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                cfgs.append(dict(kind="afd", model=model, a=a, f=fq,
+                                                 batch=batch, mtp=mtp, isl=isl,
+                                                 osl=osl, a_tp=tp, gran=g, mb=mb))
             for batch in e["colo_batches"]:
-                for ep in COLO_EP:
-                    if ep not in e["eps"]:
-                        continue
+                for ep in sorted(e["eps"]):
                     for tp in TP:
                         if ep % tp or batch % tp:
                             continue

@@ -37,14 +37,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from pathlib import Path
 
 from stability import accept
 
-ROOT = Path("/home/scratch.yuny_wwfo_1/megamoe")
-AIC = Path("/home/scratch.yuny_wwfo_1/aic/aic-yy")
-sys.path.insert(0, str(ROOT))
+# Only this module's own B200 driver (run_one, load_* and __main__) reads ROOT
+# and AIC; the GB200 sweep imports MODELS and the substitution helpers only.
+ROOT = Path(os.environ.get("AFD_MEGAMOE_ROOT") or Path(__file__).resolve().parent)
+AIC = Path(__file__).resolve().parents[2]
+if ROOT.is_dir():
+    sys.path.insert(0, str(ROOT))
 
 # Every tokens-per-rank an AFD row can ask for. AFD total concurrency is
 # batch_per_a_gpu * A and the colocated arm must match it on 8 GPUs, so the
@@ -65,6 +69,10 @@ MODELS = {
     "qwen3_235b_fp4": dict(path="Qwen/Qwen3-235B-A22B-FP8", layers=94, moe_layers=94),
     "minimax_m25_fp4": dict(path="MiniMaxAI/MiniMax-M2.5", layers=62, moe_layers=62),
     "minimax_m3_fp4": dict(path="MiniMaxAI/MiniMax-M3", layers=60, moe_layers=57),
+    # Real-GB200 (lyris) additions, not part of the original B200 study -- both
+    # all-MoE (layers == moe_layers), per model_profile in the lyris result JSONs.
+    "deepseek_v4_flash_fp4": dict(path="deepseek-ai/DeepSeek-V4-Flash", layers=43, moe_layers=43),
+    "deepseek_v4_pro_fp4": dict(path="deepseek-ai/DeepSeek-V4-Pro", layers=61, moe_layers=61),
 }
 DATABASE_MODE = {"minimax_m3_fp4": "HYBRID"}
 # B200 SXM usable HBM per GPU. static_gen does not enforce capacity itself.

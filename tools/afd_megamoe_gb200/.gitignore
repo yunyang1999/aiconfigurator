@@ -1,0 +1,7 @@
+# Symlink to the systems overlay, created by make_overlay.sh -- machine-specific.
+/data
+# Sweep and workbook outputs.
+/handoff/
+# Slurm logs (the job scripts write %x_%j.out into the submit directory).
+*.out
+*.err

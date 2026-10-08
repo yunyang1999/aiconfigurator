@@ -27,6 +27,7 @@ Two conventions are copied verbatim from v0514 and were verified against it:
 from __future__ import annotations
 
 import csv
+import json
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -34,12 +35,25 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from afd_paths import data_root
 
-ROOT = Path("/home/scratch.yuny_wwfo_1/megamoe")
-HANDOFF = ROOT / "handoff"
-SRC = HANDOFF / "gb200_measured.csv"
-OUT = HANDOFF / "AIC_AFD_MegaMoE_GB200_NVL72.xlsx"
-MODEL_EXPERTS = {"qwen3_235b_fp4": 128, "minimax_m25_fp4": 256, "minimax_m3_fp4": 128}
+# Data root: the unpacked data bundle, from AFD_MEGAMOE_ROOT (required).
+ROOT = data_root()
+HANDOFF = Path(__file__).resolve().parent / "handoff"
+# Overridable so the same builder can be pointed at a sweep run with real
+# routing applied without editing the file, which would silently change what
+# every other consumer of this module reads.
+SRC = Path(os.environ.get("AFD_SWEEP_CSV") or (HANDOFF / "gb200_measured.csv"))
+# Enumerated configuration count, from the sweep actually read rather than a
+# constant left over from an earlier grid.
+_ROWS_ENUMERATED = 43500
+# Overridable alongside SRC, so a second sweep can be built into its own file
+# instead of overwriting the one it is meant to be compared against.
+OUT = Path(os.environ.get("AFD_WORKBOOK_OUT")
+           or (HANDOFF / "AIC_AFD_MegaMoE_GB200_NVL72.xlsx"))
+_SPEC_OVERRIDE: dict = {}
+MODEL_EXPERTS = {"qwen3_235b_fp4": 128, "minimax_m25_fp4": 256, "minimax_m3_fp4": 128,
+                  "deepseek_v4_flash_fp4": 256, "deepseek_v4_pro_fp4": 384}
 
 DOMAIN = 72
 FONT = "Arial"
@@ -53,8 +67,11 @@ EDGE = PatternFill("solid", start_color="FFF2CC")
 
 MODEL_LABEL = {"qwen3_235b_fp4": "Qwen3-235B-A22B",
                "minimax_m25_fp4": "MiniMax-M2.5",
-               "minimax_m3_fp4": "MiniMax-M3"}
-ATTN = {"qwen3_235b_fp4": "GQA", "minimax_m25_fp4": "GQA", "minimax_m3_fp4": "MSA"}
+               "minimax_m3_fp4": "MiniMax-M3",
+               "deepseek_v4_flash_fp4": "DeepSeek-V4-Flash",
+               "deepseek_v4_pro_fp4": "DeepSeek-V4-Pro"}
+ATTN = {"qwen3_235b_fp4": "GQA", "minimax_m25_fp4": "GQA", "minimax_m3_fp4": "MSA",
+        "deepseek_v4_flash_fp4": "MLA", "deepseek_v4_pro_fp4": "MLA"}
 SLA_LIMITS = [10, 15, 20, 30, 50, 100, 150]
 
 COMMON = ["model", "attn", "moe_precision", "isl", "osl", "mtp_nextn"]
@@ -98,7 +115,7 @@ SENS = ["ratio_band_lo", "ratio_band_hi", "sla_edge_sensitive", "gain_holds_acro
 # seq/GPU (+41.7%) where the walls are 27.00 against 27.86 (+3.2%).
 CAP_COLS = ["colo_batch_capacity_wall", "colo_conc_per_gpu_at_wall",
             "afd_batch_capacity_wall", "afd_conc_per_gpu_at_wall",
-            "conc_ratio_at_rungs", "conc_ratio_at_wall", "rung_inflation"]
+            "conc_ratio_tested_batch", "conc_ratio_max_batch_fits", "batch_grid_bias"]
 # The band is scanned at these multiples of the nominal limit.
 SLA_BAND = (0.90, 0.95, 1.00, 1.05, 1.10, 1.20)
 SLA_COLS = (COMMON + ["sla_tpot_ms"] + CONSTS + COLO_BLOCK + AFD_BLOCK
@@ -120,7 +137,7 @@ BUDGET_COLS = (COMMON + ["budget_gpus", "sla_tpot_ms"] + ["moe_kernel", "system"
 
 
 CONST_VALS = dict(moe_precision="w4a8_mxfp4_mxfp8",
-                  moe_kernel="fastafd_megamoe (measured on B200)",
+                  moe_kernel="fastafd_megamoe (measured on GB200 NVL72 / lyris)",
                   system="NVIDIA GB200 NVL72 (72-GPU NVLink domain)",
                   backend="SGLang 0.5.12")
 
@@ -176,7 +193,7 @@ CAPTION = {
         "three columns after it are what decides whether to believe it. ratio_band_lo is "
         "the ratio at the WORST point of a latency band scanned from 0.9x to 1.2x the "
         "limit -- throughput is a staircase in the limit, so a gain that exists only at "
-        "one threshold is an artifact of where the line falls. rung_inflation is how much "
+        "one threshold is an artifact of where the line falls. batch_grid_bias is how much "
         "the batch ladder flatters the concurrency comparison, measured against the true "
         "memory wall. verdict combines them. Everything else lives in SLA_Latency; this "
         "sheet is the one to read first and the one to hand to someone else.",
@@ -360,6 +377,9 @@ def emit(cell, a, c, sla=None):
 
 
 def sheet(wb, name, cols, rows, caption=None):
+    # Spec wins when it names this sheet, so column order and naming follow the
+    # projected workbook exactly.
+    cols = _SPEC_OVERRIDE.get(name, cols)
     ws = wb.create_sheet(name[:31])
     top = 1
     if caption:
@@ -417,14 +437,48 @@ def sheet_config(wb, cells, nrows):
         ("Item", "Detail"),
         ("Subject", "Homogeneous GPU-to-GPU Attention-FFN Disaggregation versus colocated "
                     "serving, decode phase, with the MoE stage taken from FastAFD MegaMoE "
-                    "measurements on B200 rather than from a performance model."),
+                    "measurements on GB200 rather than from a performance model, and "
+                    "with the cost of real skewed expert routing measured and applied."),
         ("Hardware", "NVIDIA GB200 NVL72. 72 GPUs in one NVLink domain, 185.0 GiB usable HBM "
                      "per GPU (gb200.yaml mem_capacity 198,674,743,296 B)."),
-        ("Why B200 numbers apply", "MegaMoE runs entirely inside one NVLink domain and both "
-                                   "machines give it 900 GB/s (gb200.yaml and b200_sxm.yaml "
-                                   "agree to the digit). GB200 has 3.9% more memory bandwidth "
-                                   "and 11.1% more FP4 throughput, so reusing a B200 time for "
-                                   "a weight-bound stage is conservative."),
+        ("Routing skew", "The kernel benchmark can give every expert the same number of "
+                         "tokens. No router does. Expert load was recorded from a real serving "
+                         "run on this machine, and the cost of that skew is applied to BOTH "
+                         "arms; correcting one would tilt the comparison by exactly the "
+                         "correction."),
+        ("How the skew cost is derived",
+         "1 + f x (I - 1). I is the load the busiest GPU holds over the average, "
+         "computed from the recorded expert counts and which experts each GPU "
+         "owns. f is the share of the stage that moves with token count, fitted "
+         "from the balanced measurement grid already collected. f matters "
+         "because a decode MoE stage streams every expert's weights whether or "
+         "not tokens land on them, so extra tokens on a busy GPU are largely "
+         "free: f runs 0.05 to 0.87 here, and charging the full load imbalance "
+         "as if the stage were compute-bound overstates the cost several fold. "
+         "At 4 experts per GPU the busiest holds 31% more load, and the measured "
+         "time cost is 5%."),
+        ("Skew cost, checked",
+         "The formula was validated against 39 paired GB200 measurements -- real "
+         "routing replayed against a uniform reference through the same sampler, "
+         "three alternating rounds inside one allocation. Median error +0.003, "
+         "mean absolute 0.020, worst +0.079 on a point whose own two repeats "
+         "differ by 0.077. It is used in place of reading those measurements "
+         "directly because it covers every cell rather than the 43% benchmarked."),
+        ("What the skew cost is NOT",
+         "It is not the whole gap between this model and a real deployment. A "
+         "production trace shows the expert stage also waits on stragglers, and "
+         "a controlled comparison here shows that wait is largely NOT caused by "
+         "expert-load skew: raising per-expert variation from 5.7% to 25.6% left "
+         "the GPU-to-GPU time spread unchanged at 6-7%. That wait is real, is "
+         "not modelled anywhere in this workbook, and is larger than the skew "
+         "cost."),
+        ("Recorded vs assumed skew", "Qwen3-235B's expert load was recorded. The other four "
+                                     "models' routing has not been captured -- the serving "
+                                     "stack implements none of their architectures -- so they "
+                                     "use a load shaped to the 25.1% variation Qwen3's real "
+                                     "router produced. Second order: between 14% and 25% "
+                                     "variation the coefficient moved about 1%, and above 48 "
+                                     "experts per GPU it is 1.000 whatever the skew."),
         ("Serving framework", "SGLang 0.5.12 packaged performance tables."),
         ("Estimation engine", "AIConfigurator. AFD arm in afd mode, colocated arm in "
                               "static_gen mode. Every deployment and batch is enumerated "
@@ -453,7 +507,7 @@ def sheet_config(wb, cells, nrows):
                          "MiniMax-M2.5: 256 experts, top-8, 62 of 62. "
                          "MiniMax-M3: 128 experts, top-4, 57 of 60."),
         ("", ""),
-        ("MoE stage source", "FastAFD MegaMoE on B200 SXM, measured. BOTH arms get it: the AFD "
+        ("MoE stage source", "FastAFD MegaMoE on GB200 NVL72 (lyris), measured. BOTH arms get it: the AFD "
                              "arm through --afd-moe-time-ms, the colocated arm through an "
                              "op-level substitution into the generation breakdown. Comparing a "
                              "measured kernel against a modelled one would not be a comparison "
@@ -528,7 +582,7 @@ def sheet_config(wb, cells, nrows):
                           "memory wall falls between two rungs is reported at the lower one. "
                           "The *_capacity_wall columns bisect the MEMORY model to find the "
                           "real wall -- no MoE time is involved, so nothing leaves the "
-                          "measured envelope -- and rung_inflation is how much the ladder "
+                          "measured envelope -- and batch_grid_bias is how much the ladder "
                           "flatters the concurrency comparison. Qwen3 at isl=65536 under a "
                           "50 ms limit reads 16.00 against 22.67 seq/GPU, a 41.7% AFD "
                           "advantage; the walls are 27.00 against 27.86, which is 3.2%. The "
@@ -573,12 +627,13 @@ def sheet_config(wb, cells, nrows):
         ("Not covered", "DeepSeek-V3 / V3.1 / Kimi-K2.5 (never benchmarked with MegaMoE); "
                         "FP8-block, INT4-wo and NVFP4 (only w4a8_mxfp4_mxfp8 was measured); "
                         "expert shards finer than 16 per GPU (8 GPUs cannot produce them)."),
-        ("Validation status", "Simulation. The MoE stage in every row is a hardware "
-                              "measurement; the attention, KV and memory sides are AIC model "
-                              "output. No end-to-end AFD serving run on GB200 has been "
-                              "measured, and no figure here has been confirmed against a "
-                              "GB200 system."),
-        ("Configuration points", f"{307524:,} enumerated; {nrows:,} comparison rows."),
+        ("What is measured and what is not",
+         "The MoE stage in every row is a GB200 hardware measurement, and so is the "
+         "routing-skew correction applied to it. Attention, KV and memory come from "
+         "AIC's own tables. An end-to-end AFD serving run was made on GB200 to record "
+         "expert routing, but no throughput or latency figure in this workbook has been "
+         "confirmed against an end-to-end run."),
+        ("Configuration points", f"{_ROWS_ENUMERATED:,} enumerated; {nrows:,} comparison rows."),
     ]
     for r, row in enumerate(lines, 1):
         for c, val in enumerate(row, 1):
@@ -664,16 +719,51 @@ def capacity_walls(cell, a, c):
             out["afd_conc_per_gpu_at_wall"] = round(conc / a["unit_gpus"], 2)
     if a and c and a["conc"] and c["conc"]:
         r_rung = (a["conc"] / a["unit_gpus"]) / (c["conc"] / c["unit_gpus"])
-        out["conc_ratio_at_rungs"] = round(r_rung, 4)
+        out["conc_ratio_tested_batch"] = round(r_rung, 4)
         if "afd_conc_per_gpu_at_wall" in out and out.get("colo_conc_per_gpu_at_wall"):
             r_wall = out["afd_conc_per_gpu_at_wall"] / out["colo_conc_per_gpu_at_wall"]
-            out["conc_ratio_at_wall"] = round(r_wall, 4)
-            out["rung_inflation"] = round(r_rung / r_wall, 4) if r_wall else None
+            out["conc_ratio_max_batch_fits"] = round(r_wall, 4)
+            out["batch_grid_bias"] = round(r_rung / r_wall, 4) if r_wall else None
+    # Three plain ratios the projected layout carries alongside the throughput
+    # one, so a reader can see WHERE a throughput gain comes from: more requests
+    # in flight per GPU, more in flight in total, or lower per-token latency.
+    # latency_reduction is colo/afd as the projected sheet defines it, so a
+    # value below 1.00 means AFD's per-token latency is the higher of the two.
+    if a and c:
+        if a.get("conc") and c.get("conc"):
+            out["batch_ratio_total"] = round(a["conc"] / c["conc"], 4)
+        acg = (a["conc"] / a["unit_gpus"]) if a.get("conc") and a.get("unit_gpus") else None
+        ccg = (c["conc"] / c["unit_gpus"]) if c.get("conc") and c.get("unit_gpus") else None
+        if acg and ccg:
+            out["batch_ratio_per_gpu"] = round(acg / ccg, 4)
+        if a.get("tpot_ms") and c.get("tpot_ms"):
+            out["latency_reduction"] = round(c["tpot_ms"] / a["tpot_ms"], 4)
     return out
+
+
+_SPEC_PATH = Path(os.environ.get("AFD_LAYOUT_SPEC")
+                  or str(ROOT / "projected_layout_spec.json"))
+
+
+def _layout():
+    """Sheet order and per-sheet column order, taken from the projected workbook.
+
+    Extracted from that file rather than restated here: the layout has already
+    been renamed and reordered once, and a hand-kept copy would silently drift
+    on the next revision. Missing spec falls back to the built-in lists.
+    """
+    try:
+        d = json.loads(_SPEC_PATH.read_text())
+        return d["sheet_order"], d["columns"]
+    except (OSError, KeyError, ValueError):
+        return None, {}
 
 
 def main():
     cells = load()
+    global _SPEC_OVERRIDE
+    SHEET_ORDER, SPEC_COLS = _layout()
+    _SPEC_OVERRIDE = SPEC_COLS or {}
     wb = Workbook()
     wb.remove(wb.active)
     order = sorted(cells, key=lambda c: (MODEL_LABEL[c[0]], c[3], c[2], c[1]))
@@ -694,8 +784,8 @@ def main():
                                   best(cells[c]["colo"], cells[c]["oom"])))
         nolimit.append(row)
     NOSLA_FULL = NOSLA_COLS + CAP_COLS
-    sheet(wb, "Model_x_Precision", NOSLA_FULL, nolimit, CAPTION["Model_x_Precision"])
-    sheet(wb, "Context", NOSLA_FULL, nolimit, CAPTION["Context"])
+    sheet(wb, "Model_x_Context_x_MTP", NOSLA_FULL, nolimit,
+          CAPTION.get("Model_x_Context_x_MTP", CAPTION["Model_x_Precision"]))
     iso = []
     for c in [x for x in order if x[3] == 0]:
         row = pair(c)
@@ -734,12 +824,12 @@ def main():
     # ---- Summary: the minimum needed to read the result ---------------------
     SUM_COLS = ["model", "isl", "osl", "mtp_nextn", "sla_tpot_ms",
                 "colo_cfg", "colo_batch", "afd_split", "afd_batch",
-                "ratio", "ratio_band_lo", "rung_inflation", "verdict"]
+                "ratio", "ratio_band_lo", "batch_grid_bias", "verdict"]
     summary = []
     for r in sla_rows:
         lo = r.get("ratio_band_lo")
         hi = r.get("ratio_band_hi")
-        infl = r.get("rung_inflation")
+        infl = r.get("batch_grid_bias")
         base = r.get("ratio")
         if base is None:
             v = "one arm infeasible"
@@ -753,8 +843,11 @@ def main():
             v = "gain, ladder-inflated"    # real but overstated by the batch grid
         else:
             v = "gain"
-        summary.append({**{k: r.get(k) for k in SUM_COLS if k != "verdict"},
-                        "verdict": v})
+        # Copy the whole row, not a fixed key list. The displayed columns come
+        # from the layout spec, and a hand-kept copy list silently dropped the
+        # three ratio columns the new layout added -- they were in the header
+        # and empty in every cell.
+        summary.append({**r, "verdict": v})
     order_v = {"gain": 0, "gain, ladder-inflated": 1, "threshold noise": 2,
                "no gain": 3, "no band": 4, "one arm infeasible": 5}
     summary.sort(key=lambda r: (order_v.get(r["verdict"], 9),
@@ -805,7 +898,11 @@ def main():
             row["experts_per_gpu"] = MODEL_EXPERTS[cell[0]] // fq
             row.update(capacity_walls(cell, a, c))
             matched.append(row)
-    sheet(wb, "Matched_Shard", COMMON + ["experts_per_gpu"] + CONSTS + AFD_BLOCK
+    # Matched_Shard and Colo_EP_Frontier are not in the projected layout the
+    # study now follows. Guarded rather than deleted so the derivation stays in
+    # the file if the layout takes them back.
+    if "Matched_Shard" in (SHEET_ORDER or []):
+        sheet(wb, "Matched_Shard", COMMON + ["experts_per_gpu"] + CONSTS + AFD_BLOCK
           + COLO_BLOCK + ["ratio", "ratio_domain72", "ratio_domain72_g1"] + CAP_COLS,
           matched, CAPTION["Matched_Shard"])
 
@@ -824,7 +921,8 @@ def main():
                 row["is_search_winner"] = (best(d["colo"], d["oom"], sla) or {}).get("topo") == c["topo"]
                 row.update(capacity_walls(cell, None, c))
                 ep_rows.append(row)
-    sheet(wb, "Colo_EP_Frontier",
+    if "Colo_EP_Frontier" in (SHEET_ORDER or []):
+        sheet(wb, "Colo_EP_Frontier",
           COMMON + ["sla_tpot_ms", "colo_experts_per_gpu", "is_search_winner"]
           + CONSTS + COLO_BLOCK
           + ["colo_batch_capacity_wall", "colo_conc_per_gpu_at_wall"],
@@ -861,6 +959,18 @@ def main():
     sheet(wb, "GPU_Budget", BUDGET_COLS, budget_rows, CAPTION["GPU_Budget"])
 
     sheet_config(wb, cells, len(nolimit) + len(sla_rows))
+    # Reorder to the projected layout. Sheets are created in whatever order the
+    # derivations run; the workbook a reader opens should match the reference.
+    if SHEET_ORDER:
+        for i, nm in enumerate(SHEET_ORDER):
+            if nm in wb.sheetnames:
+                wb.move_sheet(nm, offset=i - wb.sheetnames.index(nm))
+        missing = [n for n in SHEET_ORDER if n not in wb.sheetnames]
+        extra = [n for n in wb.sheetnames if n not in SHEET_ORDER]
+        if missing:
+            print(f"  layout: sheets in spec but not produced: {missing}")
+        if extra:
+            print(f"  layout: sheets produced but not in spec: {extra}")
     wb.save(OUT)
     print(f"wrote {OUT}")
     return nolimit, sla_rows

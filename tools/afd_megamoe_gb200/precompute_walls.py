@@ -20,6 +20,7 @@ benchmarked.
 """
 from __future__ import annotations
 
+import os
 import argparse
 import collections
 import csv
@@ -27,10 +28,13 @@ import json
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from afd_paths import data_root
 
-ROOT = Path("/home/scratch.yuny_wwfo_1/megamoe")
+# Data root: the unpacked data bundle, from AFD_MEGAMOE_ROOT (required).
+ROOT = data_root()
 sys.path.insert(0, str(ROOT))
-CACHE = ROOT / "handoff" / "capacity_walls.json"
+TOOLDIR = Path(__file__).resolve().parent
+CACHE = TOOLDIR / "handoff" / "capacity_walls.json"
 
 
 def _fl(x):
@@ -134,7 +138,7 @@ def _one(key):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=14)
-    ap.add_argument("--csv", type=Path, default=ROOT / "handoff" / "gb200_measured.csv")
+    ap.add_argument("--csv", type=Path, default=TOOLDIR / "handoff" / "gb200_measured.csv")
     ap.add_argument("--out", type=Path, default=CACHE)
     a = ap.parse_args()
 

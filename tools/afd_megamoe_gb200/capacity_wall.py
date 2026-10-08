@@ -32,10 +32,13 @@ those land, this sheet bounds the ladder artefact rather than removing it.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+from afd_paths import data_root
 
-ROOT = Path("/home/scratch.yuny_wwfo_1/megamoe")
+# Data root: the unpacked data bundle, from AFD_MEGAMOE_ROOT (required).
+ROOT = data_root()
 sys.path.insert(0, str(ROOT))
 
 GIB = 1024 ** 3
