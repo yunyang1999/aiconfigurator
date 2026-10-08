@@ -37,6 +37,7 @@ def build_model_config(
     forward_model: str | None = None,
     enable_encoder_dp: bool = True,
     attention_backend: str | None = None,
+    enforce_head_tp_divisibility: bool = True,
 ) -> ModelConfig:
     """Build a ModelConfig with optional quant mode overrides."""
     return ModelConfig(
@@ -53,6 +54,7 @@ def build_model_config(
         forward_model=forward_model or "op_level",
         enable_encoder_dp=enable_encoder_dp,
         attention_backend=attention_backend,
+        enforce_head_tp_divisibility=enforce_head_tp_divisibility,
     )
 
 

@@ -26,6 +26,12 @@ class ModelConfig:
     moe_tp_size: int = None
     moe_ep_size: int = None
     attention_dp_size: int = 1
+    # False only for AFD's F-worker: there, tp_size is set to f_tp_size purely so
+    # moe_tp_size = tp_size / moe_ep_size holds (see api.py's _run_afd_estimate);
+    # it does not mean the F-worker shards attention heads (it runs no attention
+    # at all), so BaseModel's num_heads % tp_size divisibility check does not
+    # apply to it.
+    enforce_head_tp_divisibility: bool = True
     # Vision encoder data parallelism: the ViT is replicated unsharded on every rank of
     # the TP group, images are sharded across the tp_size ranks
     enable_encoder_dp: bool = True
