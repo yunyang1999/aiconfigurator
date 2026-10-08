@@ -120,9 +120,10 @@ class BaseModel:
                 f"Currently we're nothing to correct this."
             )
 
-        assert self._num_heads % model_config.tp_size == 0, (
-            f"num_heads {self._num_heads} should be divisible by tp_size {model_config.tp_size} "
-        )
+        if model_config.enforce_head_tp_divisibility:
+            assert self._num_heads % model_config.tp_size == 0, (
+                f"num_heads {self._num_heads} should be divisible by tp_size {model_config.tp_size} "
+            )
 
         self._nextn = normalize_nextn(model_config.nextn)
         model_config.nextn = self._nextn

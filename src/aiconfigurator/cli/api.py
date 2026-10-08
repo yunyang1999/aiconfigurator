@@ -1789,6 +1789,11 @@ def _run_afd_estimate(
         fmha_quant_mode,
         moe_quant_mode,
         comm_quant_mode,
+        # f_tp_size here only makes moe_tp_size = tp_size / moe_ep_size hold; the
+        # F-worker runs no attention, so num_heads has no business being checked
+        # against it (real lyris splits like deepseek_v4_pro's 48A24F trip this
+        # for models whose head count isn't a multiple of F).
+        enforce_head_tp_divisibility=False,
     )
     # Pass speculative decode knobs through to A/F model configs. The AFD
     # session expands decode compute and transfer volume to nextn + 1 target
