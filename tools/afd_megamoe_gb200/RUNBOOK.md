@@ -1,3 +1,11 @@
+> **Superseded.** This runbook describes the first version, which projected
+> B200 MegaMoE measurements onto GB200. The sweep now uses MegaMoE stage times
+> **measured on GB200 NVL72** and a per-layer routing-skew coefficient on both
+> arms. For how it works and how to run it, see
+> [`.claude/skills/aic-afd-megamoe/SKILL.md`](../../.claude/skills/aic-afd-megamoe/SKILL.md).
+> The injection mechanism in section 2 below is still accurate; the data
+> provenance and the "nothing here is a GB200 measurement" statement are not.
+
 # GB200 NVL72 projection from B200 MegaMoE measurements
 
 Projects the AFD-versus-colocated decode comparison onto a 72-GPU NVL72 domain
