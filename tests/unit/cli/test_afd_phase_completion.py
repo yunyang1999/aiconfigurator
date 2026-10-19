@@ -496,7 +496,7 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
         afd_config=cfg,
     )
 
-    metrics = session._simulate_phase(
+    session._simulate_phase(
         phase="decode",
         runtime_config=RuntimeConfig(isl=99, osl=2),
         a_model=SimpleNamespace(_num_layers=2, _nextn=2),
@@ -505,12 +505,12 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
         max_seq_len=None,
     )
 
-    # A microbatch is 8 / 2 = 4 requests. Dense A-side work sees 12 target
-    # tokens, but generation attention keeps four sequences with query_len=3
-    # so their KV prefixes are shared. The F pool receives all four A-worker
-    # microbatches, so its expanded token batch is 48.
+    # A microbatch is 8 / 2 = 4 requests, widened to 12 target tokens; on
+    # main, generation attention is widened the same way (no shared-prefix
+    # query_len path). The F pool receives all four A-worker microbatches, so
+    # its expanded token batch is 48.
     assert queried_batches == [
-        ("generation_attention", 12, 4, 3),
+        ("generation_attention", 12, None, None),
         ("generation_moe", 48, None, None),
     ]
     assert queried_transfers == [
@@ -520,9 +520,6 @@ def test_afd_nextn_expands_decode_compute_and_transfer_volume(monkeypatch):
         ("f_rs", 12),
         ("a_combine", 12),
     ]
-    assert metrics["verification_width"] == 3
-    assert metrics["a_verification_tokens_per_microbatch"] == 12
-    assert metrics["f_verification_tokens_per_microbatch"] == 48
 
 
 @pytest.mark.parametrize("value", [0.0, -1.0, math.inf, math.nan])
@@ -1289,3 +1286,69 @@ def test_cli_main_estimate_value_error_exits_without_traceback(monkeypatch):
 
     # SystemExit carries the plain message (no traceback, exit code 1).
     assert "f_moe_ep_size (7) must be a positive divisor" in str(exc_info.value)
+
+
+def _k3_model(tp_size: int, nextn: int = 0, *, f_worker: bool = False):
+    from aiconfigurator.sdk import common
+    from aiconfigurator.sdk.config import ModelConfig
+    from aiconfigurator.sdk.models import get_model
+
+    cfg = ModelConfig(
+        tp_size=tp_size,
+        moe_tp_size=1,
+        moe_ep_size=tp_size,
+        nextn=nextn,
+        moe_quant_mode=common.MoEQuantMode.w4a8_mxfp4_mxfp8,
+        enforce_head_tp_divisibility=not f_worker,
+    )
+    return get_model("moonshotai/Kimi-K3", cfg, "sglang")
+
+
+@pytest.mark.parametrize("nextn", [0, 1])
+def test_measured_stage_keeps_k3_latent_shared_and_kda_on_attention_pool(nextn):
+    """Kimi-K3 under a measured MoE stage: the stage covers only the routed
+    experts in the latent space, so router, latent projections, shared experts,
+    the dense layer, KDA layers and the draft model all stay on the A pool."""
+    from aiconfigurator.sdk.afd_partition import AFDPartitionError, build_afd_ops_partition
+    from aiconfigurator.sdk.inference_session import _keep_unmeasured_ops_on_attn
+
+    a_model, f_model = _k3_model(1, nextn), _k3_model(28, nextn, f_worker=True)
+    with pytest.raises(AFDPartitionError, match="kda"):
+        build_afd_ops_partition(a_model, phase="generation")
+
+    a_part = build_afd_ops_partition(a_model, phase="generation", allow_unknown_ops=True)
+    f_part = build_afd_ops_partition(f_model, phase="generation", allow_unknown_ops=True)
+    _keep_unmeasured_ops_on_attn(a_part, f_part, f_model)
+
+    assert [op._name for op in f_part.ffn_ops] == ["generation_moe"]
+    assert [op._name for op in a_part.ffn_ops] == ["generation_moe"]
+    a_names = {op._name for op in a_part.attn_ops}
+    for name in (
+        "generation_router_gemm",
+        "generation_latent_down_gemm",
+        "generation_latent_norm",
+        "generation_latent_up_gemm",
+        "generation_shared_gate_up_gemm",
+        "generation_shared_down_gemm",
+        "generation_dense_gate_up_gemm",
+        "generation_kda_norm",
+        "generation_kda_o_gemm",
+        "generation_attn_res",
+    ):
+        assert name in a_names
+    assert ("draft_gate_up_gemm" in a_names) == (nextn > 0)
+
+
+def test_measured_stage_keeps_shared_experts_in_stage_without_latent_moe():
+    """Without LatentMoE, shared experts run inside the measured stage (MegaMoE
+    fuses them), so only the router leaves the F side."""
+    from aiconfigurator.sdk.inference_session import _keep_unmeasured_ops_on_attn
+
+    def part(*names):
+        return SimpleNamespace(attn_ops=[], ffn_ops=[SimpleNamespace(_name=n) for n in names])
+
+    names = ("generation_router_gemm", "generation_moe", "generation_shared_gate_up_gemm")
+    a_part, f_part = part(*names), part(*names)
+    _keep_unmeasured_ops_on_attn(a_part, f_part, SimpleNamespace(extra_params=None))
+    assert [op._name for op in a_part.attn_ops] == ["generation_router_gemm"]
+    assert [op._name for op in f_part.ffn_ops] == ["generation_moe", "generation_shared_gate_up_gemm"]

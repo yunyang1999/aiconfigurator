@@ -962,6 +962,25 @@ class DisaggInferenceSession:
 _AFDCommOps = namedtuple("_AFDCommOps", ["a2f", "f2a", "f_ag", "f_rs", "a_combine"])
 
 
+def _keep_unmeasured_ops_on_attn(a_partition, f_partition, f_model) -> None:
+    """Under a measured MoE stage, move every FFN-side op the stage does not
+    cover onto the attention pool: the router, dense-FFN layers and the
+    speculative draft model. LatentMoE (Kimi-K3) runs the stage in the latent
+    space, so its hidden<->latent projections and the full-hidden shared
+    experts are outside it too. What stays in ``f_partition.ffn_ops`` is the
+    span the measurement replaces."""
+    latent_moe = getattr(getattr(f_model, "extra_params", None), "routed_expert_hidden_size", 0) or 0
+    markers = ("router", "_dense_", "draft_") + (("latent", "shared") if latent_moe else ())
+
+    def _outside_stage(op) -> bool:
+        return any(m in op._name.lower() for m in markers)
+
+    moved = [op for op in a_partition.ffn_ops if _outside_stage(op)]
+    a_partition.attn_ops.extend(moved)
+    a_partition.ffn_ops = [op for op in a_partition.ffn_ops if op not in moved]
+    f_partition.ffn_ops = [op for op in f_partition.ffn_ops if not _outside_stage(op)]
+
+
 class AFDInferenceSession:
     """Attention-FFN Disaggregated inference session.
 
@@ -1647,16 +1666,20 @@ class AFDInferenceSession:
         # Boundary ops (``add_norm_2`` / ``logits_gemm``) default to the
         # A-Worker, but ``cfg.boundary_on_attn`` lets the user reassign
         # them to the F-Worker for sensitivity studies.
-        a_partition = build_afd_ops_partition(a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
-        f_partition = build_afd_ops_partition(f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn)
         afd_moe_time_ms = self._afd_moe_time_ms if phase == "decode" else None
-        if afd_moe_time_ms is not None:
-            # A measured MoE stage replaces the whole F side (dispatch, expert
-            # compute, combine); the router stays on the attention pool.
-            router_ops = [op for op in a_partition.ffn_ops if "router" in op._name.lower()]
-            a_partition.attn_ops.extend(router_ops)
-            a_partition.ffn_ops = [op for op in a_partition.ffn_ops if op not in router_ops]
-            f_partition.ffn_ops = [op for op in f_partition.ffn_ops if "router" not in op._name.lower()]
+        # A measured MoE stage replaces the whole F side (dispatch, expert
+        # compute, combine) and everything outside it runs on the attention
+        # pool, so ops the marker rules do not cover (e.g. KDA layers) default
+        # to the A side instead of failing the partition.
+        measured = afd_moe_time_ms is not None
+        a_partition = build_afd_ops_partition(
+            a_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn, allow_unknown_ops=measured
+        )
+        f_partition = build_afd_ops_partition(
+            f_model, phase=ops_phase, boundary_on_attn=cfg.boundary_on_attn, allow_unknown_ops=measured
+        )
+        if measured:
+            _keep_unmeasured_ops_on_attn(a_partition, f_partition, f_model)
 
         isl = runtime_config.isl
         osl = runtime_config.osl or 1
