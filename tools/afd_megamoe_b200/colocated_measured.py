@@ -73,6 +73,12 @@ MODELS = {
     # all-MoE (layers == moe_layers), per model_profile in the lyris result JSONs.
     "deepseek_v4_flash_fp4": dict(path="deepseek-ai/DeepSeek-V4-Flash", layers=43, moe_layers=43),
     "deepseek_v4_pro_fp4": dict(path="deepseek-ai/DeepSeek-V4-Pro", layers=61, moe_layers=61),
+    # Kimi-K3: dense layer 0 + 92 LatentMoE layers. Unlike the models above,
+    # AIC prices the dense layer with its own dense-FFN ops and the DSPARK
+    # draft model is dense too, so AIC's MoE op covers exactly the 92 measured
+    # layers (at the nextN-widened batch) and nothing is left uncovered.
+    "kimi_k3_fp4": dict(path="moonshotai/Kimi-K3", layers=93, moe_layers=92,
+                        aic_moe_layers=92, draft_moe_layers=0),
 }
 DATABASE_MODE = {"minimax_m3_fp4": "HYBRID"}
 # B200 SXM usable HBM per GPU. static_gen does not enforce capacity itself.
@@ -134,7 +140,9 @@ def average_overlap_parts(model, database, runtime_config, op):
     return router_total / d, expert_total / d
 
 
-def uncovered_layer_equivalents(layers: int, moe_layers: int, nextn: int) -> tuple[int, int]:
+def uncovered_layer_equivalents(layers: int, moe_layers: int, nextn: int, *,
+                                aic_moe_layers: int | None = None,
+                                draft_moe_layers: int = 1) -> tuple[int, int]:
     """(uncovered, total) MoE layer-equivalents, in AIC's own accounting.
 
     AIC bills q*layers + nextn layer-equivalents of MoE work, where q = nextn+1;
@@ -144,20 +152,24 @@ def uncovered_layer_equivalents(layers: int, moe_layers: int, nextn: int) -> tup
       * q*(layers - moe_layers) dense layers, which only MiniMax-M3 has (3 of
         its 60). Qwen3-235B and MiniMax-M2.5 are all-MoE, so for them the
         uncovered part is PURELY the draft layers and is exactly zero at nextn=0.
+
+    `aic_moe_layers` / `draft_moe_layers` override that billing for a model
+    whose AIC graph prices dense layers or the draft model with dense ops
+    (Kimi-K3: 92 and 0, so nothing is uncovered).
     """
     q = nextn + 1
-    total = q * layers + nextn
+    total = q * (layers if aic_moe_layers is None else aic_moe_layers) + nextn * draft_moe_layers
     return max(total - q * moe_layers, 0), total
 
 
-def unmeasured_moe_fraction(layers: int, moe_layers: int, nextn: int) -> float:
+def unmeasured_moe_fraction(layers: int, moe_layers: int, nextn: int, **billing) -> float:
     """Uncovered share, kept for reporting."""
-    unc, total = uncovered_layer_equivalents(layers, moe_layers, nextn)
+    unc, total = uncovered_layer_equivalents(layers, moe_layers, nextn, **billing)
     return unc / total if total else 0.0
 
 
 def substitute(generation: dict, context: dict, *,
-               measured_ms: float, layers: int, moe_layers: int, nextn: int):
+               measured_ms: float, layers: int, moe_layers: int, nextn: int, **billing):
     """Return (new_total, generic_moe, router_note, residual, fused).
 
     Two op layouts occur:
@@ -215,7 +227,7 @@ def substitute(generation: dict, context: dict, *,
     # MoE layer. For MiniMax-M3's 3 dense layers it is a proxy, but it is the
     # same proxy AIC itself applies (it prices them with the MoE op too), so the
     # substitution stays self-consistent.
-    uncovered, total_equiv = uncovered_layer_equivalents(layers, moe_layers, nextn)
+    uncovered, total_equiv = uncovered_layer_equivalents(layers, moe_layers, nextn, **billing)
     covered = max(total_equiv - uncovered, 1)
     residual = measured_ms / covered * uncovered
     new_total = total - generic_expert + measured_ms + residual

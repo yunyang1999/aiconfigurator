@@ -63,8 +63,10 @@ from afd_paths import data_root
 # Data root: the unpacked data bundle, from AFD_MEGAMOE_ROOT (required).
 ROOT = data_root()
 # Repository root, derived rather than hard-coded so a fresh checkout runs
-# from wherever it was cloned.
-AIC = Path(__file__).resolve().parents[2]
+# from wherever it was cloned. AFD_AIC_ROOT points the sweep at another AIC
+# checkout instead -- Kimi-K3 runs on upstream main, which carries the K3 model
+# and its GB200 data.
+AIC = Path(os.environ.get("AFD_AIC_ROOT") or Path(__file__).resolve().parents[2])
 sys.path.insert(0, str(ROOT))
 
 TOOLDIR = Path(__file__).resolve().parent
@@ -78,8 +80,15 @@ TOOLDIR = Path(__file__).resolve().parent
 # The systems ROOT, not its data/ subdirectory: "default" resolves to
 # .../aiconfigurator_core/systems and the loader appends data/ itself. Pointing
 # one level too deep resolved cleanly and silently found nothing.
+#
+# The overlay mirrors THIS branch's systems tree, so a run on another checkout
+# (AFD_AIC_ROOT) replaces the whole path with AFD_AIC_SYSTEMS -- for upstream,
+# "default,$AFD_MEGAMOE_ROOT/aic_systems_upstream" from make_upstream_systems.sh.
+# AFD_COLO_SYSTEM names the colocated arm's system there (gb200_nvl72; see that
+# script for why).
 OVERLAY = str(ROOT / "aic_overlay")
-SYSPATHS = f"{OVERLAY},default,{TOOLDIR}"
+SYSPATHS = os.environ.get("AFD_AIC_SYSTEMS") or f"{OVERLAY},default,{TOOLDIR}"
+COLO_SYSTEM = os.environ.get("AFD_COLO_SYSTEM", "gb200_g4")
 DOMAIN = 72
 CAPACITY_GIB = 198674743296 / 1024 ** 3     # gb200.yaml mem_capacity, 185.02 GiB
 GIB = 1024 ** 3
@@ -88,8 +97,15 @@ MODEL_PATH = {"qwen3_235b_fp4": "Qwen/Qwen3-235B-A22B-FP8",
               "minimax_m25_fp4": "MiniMaxAI/MiniMax-M2.5",
               "minimax_m3_fp4": "MiniMaxAI/MiniMax-M3",
               "deepseek_v4_flash_fp4": "deepseek-ai/DeepSeek-V4-Flash",
-              "deepseek_v4_pro_fp4": "deepseek-ai/DeepSeek-V4-Pro"}
+              "deepseek_v4_pro_fp4": "deepseek-ai/DeepSeek-V4-Pro",
+              "kimi_k3_fp4": "moonshotai/Kimi-K3"}
 DB_MODE = {"minimax_m3_fp4": "HYBRID"}
+# K3 runs on upstream main, whose queryable sglang versions are 0.5.14 (current)
+# and 0.5.16 (next). Its KDA kernels exist only at 0.5.16; MoE, MLA and GEMM
+# backward-fill from 0.5.14. AFD_BACKEND_VERSION sets every other model's
+# version for such a run (0.5.16 puts a Qwen3 anchor on the same data as K3).
+BACKEND_VERSION = {"kimi_k3_fp4": "0.5.16"}
+DEFAULT_BACKEND_VERSION = os.environ.get("AFD_BACKEND_VERSION", "0.5.12")
 NEXTN_ACCEPTED = {0: None, 1: 0.85, 2: 1.53}
 
 # A is not swept independently: real lyris data measured one (A, F) split per F.
@@ -154,6 +170,8 @@ ROUTING_DIST = {
     "minimax_m3_fp4": ROOT / "synthetic_perlayer_128.json",
     "deepseek_v4_flash_fp4": ROOT / "synthetic_perlayer_256.json",
     "deepseek_v4_pro_fp4": ROOT / "synthetic_perlayer_384.json",
+    # 92 LatentMoE layers x 896 experts, same generator (build_k3_routing.py).
+    "kimi_k3_fp4": ROOT / "synthetic_perlayer_896.json",
 }
 ROUTING_DIST_AGGREGATED = {
     "qwen3_235b_fp4": ROOT / "real_routing_qwen3_235b.json",
@@ -203,8 +221,27 @@ def _est():
         from aiconfigurator.cli.api import cli_estimate
         from aiconfigurator_core.sdk.perf_database import set_systems_paths
         set_systems_paths(SYSPATHS)
+        _k3_draft_proxy()
         _EST = cli_estimate
     return _EST
+
+
+def _k3_draft_proxy():
+    """Price Kimi-K3's DSPARK draft attention on a shape GB200 has data for.
+
+    The sglang draft is GQA 64q/16kv at head_dim 64, and GB200's sglang tables
+    have no row at that shape (or its tp=2/4 shards) -- the only K3 op without
+    data, and only under MTP. 32q/8kv at head_dim 128 keeps the q and kv widths
+    (4096 / 1024), so the draft GEMMs, KV bytes per token, attention FLOPs and
+    GQA ratio are all unchanged; only the kernel's head granularity differs.
+    """
+    try:
+        from aiconfigurator_core.sdk.models.kimi_k3 import KimiK3Model
+    except ImportError:          # a checkout without K3
+        return
+    m = KimiK3Model
+    assert (m.DRAFT_NUM_HEADS, m.DRAFT_NUM_KV_HEADS, m.DRAFT_HEAD_DIM) in ((64, 16, 64), (32, 8, 128))
+    m.DRAFT_NUM_HEADS, m.DRAFT_NUM_KV_HEADS, m.DRAFT_HEAD_DIM = 32, 8, 128
 
 
 def domain_units(unit_gpus):
@@ -214,7 +251,7 @@ def domain_units(unit_gpus):
 
 def _afd_once(model, a, fq, tp, g, batch, isl, osl, mtp, moe_ms, mb=1):
     kw = dict(model_path=MODEL_PATH[model], system_name=f"gb200_g{g}",
-              backend_name="sglang", backend_version="0.5.12", mode="afd",
+              backend_name="sglang", backend_version=BACKEND_VERSION.get(model, DEFAULT_BACKEND_VERSION), mode="afd",
               moe_quant_mode="w4a8_mxfp4_mxfp8",
               database_mode=DB_MODE.get(model, "HYBRID"),
               isl=isl, osl=osl, nextn=mtp, afd_combined_with_pd=False,
@@ -312,8 +349,8 @@ def run_colo(cfg):
         row["status"] = "illegal"
         return row
     row["moe_ms"] = round(ms, 6)
-    kw = dict(model_path=m["path"], system_name="gb200_g4", backend_name="sglang",
-              backend_version="0.5.12", mode="static_gen",
+    kw = dict(model_path=m["path"], system_name=COLO_SYSTEM, backend_name="sglang",
+              backend_version=BACKEND_VERSION.get(model, DEFAULT_BACKEND_VERSION), mode="static_gen",
               moe_quant_mode="w4a8_mxfp4_mxfp8",
               database_mode=DB_MODE.get(model, "HYBRID"),
               isl=cfg["isl"], osl=cfg["osl"], nextn=cfg["mtp"],
@@ -343,10 +380,11 @@ def run_colo(cfg):
     if row["memory_gb"] > CAPACITY_GIB:
         row["status"] = "oom"
         return row
+    billing = {k: m[k] for k in ("aic_moe_layers", "draft_moe_layers") if k in m}
     try:
         new_total, generic_moe, _r, residual, fused, comm_share = substitute(
             gen, ctx, measured_ms=ms, layers=m["layers"],
-            moe_layers=m["moe_layers"], nextn=cfg["mtp"])
+            moe_layers=m["moe_layers"], nextn=cfg["mtp"], **billing)
     except Exception as e:
         row["status"] = "error"
         row["error"] = f"substitution failed: {str(e)[:100]}"
@@ -369,7 +407,7 @@ def run_colo(cfg):
                attention_ms=round(sum(v for k, v in gen.items()
                                       if op_group(k) == "attention"), 4),
                unmeasured_moe_fraction=round(
-                   unmeasured_moe_fraction(m["layers"], m["moe_layers"], cfg["mtp"]), 4),
+                   unmeasured_moe_fraction(m["layers"], m["moe_layers"], cfg["mtp"], **billing), 4),
                tpsgpu_domain72=round(tps * gpus * n / DOMAIN, 2))
     return row
 
@@ -382,14 +420,14 @@ def dispatch(c):
                 "status": "error", "error": f"{type(e).__name__}: {e}"[:140]}
 
 
-def build_configs():
+def build_configs(models=None):
     T = table()
     from megamoe_table import REAL_AGS, REAL_SPLITS
     cfgs, seen = [], set()
     for mtp in MTPS:
       env = T.envelope(mtp)
       for osl in OSLS_BY_MTP[mtp]:
-       for model in sorted(MODEL_PATH):
+       for model in sorted(models or MODEL_PATH):
         e = env.get(model)
         if not e:
             continue
@@ -454,9 +492,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=14)
     ap.add_argument("--out", type=Path, default=ROOT / "handoff" / "gb200_measured.csv")
+    ap.add_argument("--models", nargs="+", choices=sorted(MODEL_PATH),
+                    help="restrict the sweep to these models (default: all)")
     args = ap.parse_args()
 
-    cfgs = build_configs()
+    cfgs = build_configs(args.models)
     n_afd = sum(1 for c in cfgs if c["kind"] == "afd")
     print(f"configs: {len(cfgs)}  (afd {n_afd}, colo {len(cfgs) - n_afd})", flush=True)
 

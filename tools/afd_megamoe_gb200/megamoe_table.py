@@ -113,6 +113,9 @@ REAL_AGS = {
     "minimax_m3_fp4":        {4: (68,), 8: (64, 32, 16), 16: (56, 28), 32: (40, 20)},
     "deepseek_v4_flash_fp4": {4: (68,), 8: (64, 32, 16), 16: (56, 28), 32: (40, 20)},
     "deepseek_v4_pro_fp4":   {8: (64, 32, 16), 12: (60,), 16: (56, 28), 24: (48, 24, 12)},
+    # 896 experts: F must divide 896 and be node-aligned, so 64A8F / 56A16F /
+    # 44A28F / 40A32F (F = 4 cannot hold 1347 GiB of routed weights).
+    "kimi_k3_fp4":           {8: (64, 32, 16), 16: (56, 28), 28: (44,), 32: (40, 20)},
 }
 # Kept as the deployment-split view (F -> the tp=1 ag), for callers that want
 # "what is the full-width split for this F" rather than "what is measurable".

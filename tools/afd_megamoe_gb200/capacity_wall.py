@@ -58,8 +58,11 @@ def _colo_memory(est, model_path, ep, tp, batch, isl, osl, mtp):
     acc = NEXTN_ACCEPTED.get(mtp)
     if acc is not None:
         kw["nextn_accepted"] = acc
-    r = est(model_path=model_path, system_name="gb200_g4", backend_name="sglang",
-            backend_version="0.5.12", mode="static_gen",
+    from run_gb200_measured import BACKEND_VERSION, COLO_SYSTEM, DEFAULT_BACKEND_VERSION, MODEL_PATH
+    version = next((BACKEND_VERSION[k] for k, p in MODEL_PATH.items()
+                    if p == model_path and k in BACKEND_VERSION), DEFAULT_BACKEND_VERSION)
+    r = est(model_path=model_path, system_name=COLO_SYSTEM, backend_name="sglang",
+            backend_version=version, mode="static_gen",
             moe_quant_mode="w4a8_mxfp4_mxfp8", database_mode="HYBRID",
             isl=isl, osl=osl, nextn=mtp, tp_size=tp, attention_dp_size=ep // tp,
             moe_ep_size=ep, batch_size=batch, **kw)
@@ -115,7 +118,13 @@ def afd_wall(run_once, model, a, f, tp, g, isl, osl, mtp, mb, hi=4096):
         except Exception as e:
             return "OOM" not in str(e)
 
-    if not ok(lo):
+    # The starting batch must actually run. ok() lets non-OOM errors through so
+    # one bad probe does not end the bisection, but a configuration that raises
+    # at EVERY batch (Kimi-K3 at F=28 before the F-worker head check was fixed)
+    # would then "fit" everywhere and report its wall at `hi`.
+    try:
+        run_once(model, a, f, tp, g, lo, isl, osl, mtp, 10.0, mb)
+    except Exception:
         return None, None
     while True:
         nxt = lo * 2

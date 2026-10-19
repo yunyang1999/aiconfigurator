@@ -175,3 +175,43 @@ and iterations >= 40.
 * **MiniMax-M3's attention** -- MSA has no silicon rows, so it comes from SOL plus
   an empirical factor, and that term is 42% to 61% of the M3 decode step. M3's
   numbers are softer than the other two models'.
+
+## 8. Kimi-K3 on upstream main
+
+K3 (KDA linear attention + MLA, LatentMoE with 896 experts) exists only on
+upstream main, so its slice runs this tooling against that checkout instead of
+this branch's engine; the other models' results are untouched.
+
+* **Engine.** An upstream-main checkout with the measured-stage AFD commits
+  (`afd_moe_time_ms`, serial m=1, F-worker head check) plus two K3 fixes: ops
+  outside the measured stage stay on the A pool (router, dense layer, draft
+  model, and for LatentMoE the latent projections and shared experts -- the
+  stage covers only routed experts in the 3584 latent space), and K3's KDA
+  head check skips the F-worker so F=28 builds.
+* **Systems.** `make_upstream_systems.sh` writes
+  `$AFD_MEGAMOE_ROOT/aic_systems_upstream`: the granularity files, plus
+  `gb200_nvl72` (the 72-GPU NVLink domain as one node) for the colocated arm,
+  because upstream gates EP > 4 on DeepEP tables K3 does not have. At EP=4 the
+  two files agree op for op.
+* **Version.** sglang 0.5.16 for every model in the run: K3's KDA tables exist
+  only there; all other families backward-fill from 0.5.14.
+* **Measured stage.** `kimi_k3_fp4` in FastAFD's profiles, routed experts only
+  (latent 3584, inter 3072, top-16, no shared expert in the stage). Splits
+  64A8F / 56A16F / 44A28F / 40A32F with tp 2/4 fan-ins where node-aligned;
+  colocated EP 8/16/32/64. Routing skew is assumed (`build_k3_routing.py`).
+* **Run.** `sbatch sweep_k3_upstream.sbatch` with `AIC_PY`, `AFD_MEGAMOE_ROOT`
+  and `AFD_AIC_ROOT` set. Qwen3-235B rides along as an anchor on the same engine.
+
+Read K3 with these in mind:
+
+* **Engine offset.** Same injected stage, same memory -- but on upstream's
+  0.5.14 tables Qwen3's non-attention A-side work is cheaper than on this
+  branch's 0.5.12 ones (TPOT -7 to -15% AFD, -8 to -10% colocated at isl 4096).
+  Compare K3 with the Qwen3 anchor from the same run, not with this branch's CSV.
+* **KDA state.** Upstream charges 5 radix-cache state slots per request
+  (~2.2 GB per request at tp=1), so K3 is memory-bound in both arms well before
+  the stage saturates.
+* **MTP.** Upstream widens generation attention by nextN+1 (no shared-KV
+  query_len path), and K3's sglang draft attention (64q/16kv, head 64) has no
+  GB200 rows: it is priced as 32q/8kv at head 128 -- same widths, bytes, FLOPs
+  and GQA ratio.
