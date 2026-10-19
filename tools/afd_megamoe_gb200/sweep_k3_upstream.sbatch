@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Kimi-K3 AFD-vs-colocated sweep with the measured MegaMoE stage injected,
-# on upstream-main AIC (which carries the K3 model and its GB200 KDA/MLA/MoE
-# data), plus Qwen3-235B as an anchor on the same engine and data version so
-# K3 can be read against a model whose own-branch results already exist.
+# AFD-vs-colocated sweep with the measured MegaMoE stage injected, on
+# upstream-main AIC. Default: Kimi-K3 (which only upstream carries) plus
+# Qwen3-235B as an anchor on the same engine and data version. MODELS / TAG
+# override the model list and output names, e.g. the five existing models
+# re-run on upstream's GB200 tables (fp8_block GEMMs were recollected there,
+# #1533) for comparison with this branch's CSV.
 #
 #   engine   AFD_AIC_ROOT -> upstream-main checkout with the measured-stage
 #            AFD commits (see that branch's log)
@@ -29,13 +31,15 @@ export AFD_BACKEND_VERSION=0.5.16
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 export PYTHONPATH=../afd_megamoe_b200:.
 OUT="${AFD_MEGAMOE_ROOT}/handoff"
+MODELS=${MODELS:-kimi_k3_fp4 qwen3_235b_fp4}
+TAG=${TAG:-k3_upstream}
 echo "node=$(hostname) arch=$(uname -m) started=$(date -Is)"
 git -C "${AFD_AIC_ROOT}" log --oneline -1
 
 bash make_upstream_systems.sh
 
 echo "=== measured K3 envelope ==="
-$PY - <<'PYEOF'
+[[ " ${MODELS} " == *" kimi_k3_fp4 "* ]] && $PY - <<'PYEOF'
 import run_gb200_measured as R
 T = R.table()
 for mtp in (0, 1, 2):
@@ -47,10 +51,9 @@ for mtp in (0, 1, 2):
 PYEOF
 
 echo "=== sweep ==="
-$PY run_gb200_measured.py --models kimi_k3_fp4 qwen3_235b_fp4 --workers 64 \
-    --out "${OUT}/gb200_measured_k3_upstream.csv"
+$PY run_gb200_measured.py --models ${MODELS} --workers 64 --out "${OUT}/gb200_measured_${TAG}.csv"
 
 echo "=== capacity walls ==="
-$PY precompute_walls.py --workers 64 --csv "${OUT}/gb200_measured_k3_upstream.csv" \
-    --out "${OUT}/capacity_walls_k3_upstream.json"
+$PY precompute_walls.py --workers 64 --csv "${OUT}/gb200_measured_${TAG}.csv" \
+    --out "${OUT}/capacity_walls_${TAG}.json"
 echo "finished=$(date -Is)"
