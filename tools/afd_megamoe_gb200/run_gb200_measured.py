@@ -221,13 +221,16 @@ def _est():
         from aiconfigurator.cli.api import cli_estimate
         from aiconfigurator_core.sdk.perf_database import set_systems_paths
         set_systems_paths(SYSPATHS)
-        _k3_draft_proxy()
+        _k3_overrides()
         _EST = cli_estimate
     return _EST
 
 
-def _k3_draft_proxy():
-    """Price Kimi-K3's DSPARK draft attention on a shape GB200 has data for.
+def _k3_overrides():
+    """Kimi-K3 adjustments applied in every worker before any model is built.
+
+    Draft attention: price Kimi-K3's DSPARK draft attention on a shape GB200
+    has data for.
 
     The sglang draft is GQA 64q/16kv at head_dim 64, and GB200's sglang tables
     have no row at that shape (or its tp=2/4 shards) -- the only K3 op without
@@ -242,6 +245,12 @@ def _k3_draft_proxy():
     m = KimiK3Model
     assert (m.DRAFT_NUM_HEADS, m.DRAFT_NUM_KV_HEADS, m.DRAFT_HEAD_DIM) in ((64, 16, 64), (32, 8, 128))
     m.DRAFT_NUM_HEADS, m.DRAFT_NUM_KV_HEADS, m.DRAFT_HEAD_DIM = 32, 8, 128
+    # KDA state slots (sensitivity): upstream charges KDA_STATE_SLOTS_PER_REQUEST
+    # (5) radix-cache state slots per request, ~2.2 GB at tp=1; a decode worker
+    # without prefix caching holds one. AFD_K3_KDA_SLOTS overrides the count.
+    slots = os.environ.get("AFD_K3_KDA_SLOTS")
+    if slots:
+        m.KDA_STATE_SLOTS_PER_REQUEST = int(slots)
 
 
 def domain_units(unit_gpus):
