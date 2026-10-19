@@ -111,8 +111,9 @@ class KimiK3Model(BaseModel):
         # KDA heads shard evenly across attention TP; a non-divisor (or tp >
         # heads) would silently truncate nk_local to a shard geometry that has
         # no collector row (rows exist for 96/48/24/12 only) — fail loudly
-        # instead of mispricing (review fix).
-        if cfg.kda_num_heads % self.config.tp_size != 0:
+        # instead of mispricing (review fix). Not on AFD's F-worker, which
+        # runs no attention (same exemption as the base head check).
+        if self.config.enforce_head_tp_divisibility and cfg.kda_num_heads % self.config.tp_size != 0:
             raise ValueError(
                 f"Kimi-K3 KDA heads ({cfg.kda_num_heads}) are not divisible by "
                 f"tp_size ({self.config.tp_size}); per-rank KDA shard would be "
