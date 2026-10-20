@@ -201,7 +201,7 @@ class MeasuredStage:
                 if not accept(j):
                     continue
                 w, t, mp = j["workload"], j["topology"], j["model_profile"]
-                if "ag_size" not in t or w.get("microbatches") not in (1, 2, 4):
+                if "ag_size" not in t or w.get("microbatches") not in (1, 2, 3, 4):
                     continue
                 if w.get("routing") != "balanced":
                     continue        # hotset rows live in the same directory
@@ -512,7 +512,7 @@ class MeasuredStage:
 
     # ----------------------------------------------------------- descriptions
     def envelope(self, nextn=0):
-        """{model: {'shards', 'seqs', 'eps', 'colo_batches', 'mb1/2/4', 'ags'}}
+        """{model: {'shards', 'seqs', 'eps', 'colo_batches', 'mb1/2/3/4', 'ags'}}
 
         `mbN` are sets of (shard, seq, ag) triples -- the sweep asks "is THIS
         exact condition measured at this microbatch count", and ag belongs in
@@ -521,7 +521,7 @@ class MeasuredStage:
         """
         out = defaultdict(lambda: {"shards": set(), "seqs": set(), "eps": set(),
                                    "colo_batches": set(), "mb1": set(), "mb2": set(),
-                                   "mb4": set(), "ags": defaultdict(set)})
+                                   "mb3": set(), "mb4": set(), "ags": defaultdict(set)})
         for (m, n, mb, shard, seq, ag) in self.base:
             if n == nextn:
                 out[m]["shards"].add(shard); out[m]["seqs"].add(seq)
@@ -530,7 +530,7 @@ class MeasuredStage:
         for (m, n, ep, b) in self._colo:
             if n == nextn:
                 out[m]["eps"].add(ep); out[m]["colo_batches"].add(b)
-        return {m: {k: (v if k in ("mb1", "mb2", "mb4") else
+        return {m: {k: (v if k in ("mb1", "mb2", "mb3", "mb4") else
                         ({s: sorted(a) for s, a in v.items()} if k == "ags" else sorted(v)))
                     for k, v in d.items()} for m, d in out.items()}
 
