@@ -168,7 +168,9 @@ ROUTING_DIST = {
     # is more informative than that.
     "minimax_m25_fp4": ROOT / "synthetic_perlayer_256.json",
     "minimax_m3_fp4": ROOT / "synthetic_perlayer_128.json",
-    "deepseek_v4_flash_fp4": ROOT / "synthetic_perlayer_256.json",
+    # Recorded: DeepSeek-V4-Flash real weights, 1152 real prompts, 43 layers kept
+    # separate (hash-routed layers 0-2 included as routed).
+    "deepseek_v4_flash_fp4": ROOT / "real_routing_dsv4_flash_perlayer.json",
     "deepseek_v4_pro_fp4": ROOT / "synthetic_perlayer_384.json",
     # 92 LatentMoE layers x 896 experts, same generator (build_k3_routing.py).
     "kimi_k3_fp4": ROOT / "synthetic_perlayer_896.json",
@@ -181,7 +183,7 @@ ROUTING_DIST_AGGREGATED = {
     "deepseek_v4_pro_fp4": ROOT / "synthetic_cvmeasured_384.json",
 }
 # Which models' skew is recorded rather than assumed; the workbook says so.
-ROUTING_IS_REAL = {"qwen3_235b_fp4"}
+ROUTING_IS_REAL = {"qwen3_235b_fp4", "deepseek_v4_flash_fp4"}
 
 
 def _routing_distributions():
