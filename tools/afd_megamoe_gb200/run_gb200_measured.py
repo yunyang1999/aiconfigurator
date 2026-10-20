@@ -134,7 +134,7 @@ OSLS_BY_MTP = {0: (256, 1024, 4096), 1: (1024,), 2: (1024,)}
 # measured mb=4 (further overlap, further weight-restream cost); all three
 # counts are measured, so all three are swept and each cell keeps whichever
 # is best.
-MBS = (1, 2, 4)
+MBS = (1, 2, 3, 4)   # m = 3 joins where its stage was measured (rungs divisible by 3)
 
 _T = None
 _EST = None
