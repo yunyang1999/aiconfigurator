@@ -492,23 +492,53 @@ class MeasuredStage:
         if not ne or shard <= 0:
             return None
         imb = self._rank_imbalance(model, ne // shard)
+        if imb is None or imb <= 1.0:
+            return None
         curve = {b: v for (m, n, mbb, sh, b, a), v in self.base.items()
                  if (m, n, mbb, sh, a) == (model, nextn, mb, shard, ag)}
-        hit = self._skew_cost(imb, curve, batch)
-        if hit is None:
+        f, note = self._token_fraction(curve, batch), ""
+        if f is None:
+            # a curve with fewer than two usable batch points cannot give f; take it
+            # from the nearest measured curve of the same model and shard (same
+            # nextn first, then any), so every EP > 1 cell carries the coefficient.
+            f, note = self._fallback_fraction_afd(model, nextn, mb, shard, ag, batch), ", f from nearest curve"
+        if f is None:
             return None
         kind = "recorded" if model in self.real_skew else "assumed"
-        return hit, f"routing skew {kind}, F={ne // shard}"
+        return 1.0 + f * (imb - 1.0), f"routing skew {kind}, F={ne // shard}{note}"
+
+    def _fallback_fraction_afd(self, model, nextn, mb, shard, ag, batch):
+        cands = {}
+        for (m, n, mbb, sh, b, a), v in self.base.items():
+            if m == model and sh == shard and not (n, mbb, a) == (nextn, mb, ag):
+                cands.setdefault((n, mbb, a), {})[b] = v
+        for key in sorted(cands, key=lambda k: (k[0] != nextn, abs(k[2] - ag), abs(k[1] - mb))):
+            f = self._token_fraction(cands[key], batch)
+            if f is not None:
+                return f
+        return None
 
     def _coeff_colo(self, model, nextn, ep, batch):
         imb = self._rank_imbalance(model, ep)
+        if imb is None or imb <= 1.0:
+            return None
         curve = {b: st.median(v) for (m, n, e, b), v in self._colo.items()
                  if (m, n, e) == (model, nextn, ep) and v}
-        hit = self._skew_cost(imb, curve, batch)
-        if hit is None:
+        f, note = self._token_fraction(curve, batch), ""
+        if f is None:
+            cands = {}
+            for (m, n, e, b), v in self._colo.items():
+                if m == model and v and not (n, e) == (nextn, ep):
+                    cands.setdefault((n, e), {})[b] = st.median(v)
+            for key in sorted(cands, key=lambda k: (k[0] != nextn, abs(k[1] - ep))):
+                f = self._token_fraction(cands[key], batch)
+                if f is not None:
+                    note = ", f from nearest curve"
+                    break
+        if f is None:
             return None
         kind = "recorded" if model in self.real_skew else "assumed"
-        return hit, f"routing skew {kind}, EP={ep}"
+        return 1.0 + f * (imb - 1.0), f"routing skew {kind}, EP={ep}{note}"
 
     # ----------------------------------------------------------- descriptions
     def envelope(self, nextn=0):
